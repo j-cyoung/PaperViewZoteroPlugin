@@ -134,18 +134,22 @@ def main():
 
     args = ap.parse_args()
 
+    def apply_base_dir(path: str, base_dir: str) -> str:
+        if not base_dir or os.path.isabs(path):
+            return path
+        base_norm = os.path.normpath(base_dir)
+        path_norm = os.path.normpath(path)
+        if path_norm == base_norm or path_norm.startswith(base_norm + os.sep):
+            return path
+        return os.path.join(base_dir, path)
+
     if args.base_output_dir:
         os.makedirs(os.path.dirname(args.base_output_dir), exist_ok=True)
-        if not os.path.isabs(args.pdf_dir):
-            args.pdf_dir = os.path.join(args.base_output_dir, os.path.relpath(args.pdf_dir, "."))
-        if not os.path.isabs(args.md_dir):
-            args.md_dir = os.path.join(args.base_output_dir, os.path.relpath(args.md_dir, "."))
-        if not os.path.isabs(args.out_jsonl):
-            args.out_jsonl = os.path.join(args.base_output_dir, os.path.relpath(args.out_jsonl, "."))
-        if not os.path.isabs(args.issues_out):
-            args.issues_out = os.path.join(args.base_output_dir, os.path.relpath(args.issues_out, "."))
-        if not os.path.isabs(args.image_dir):
-            args.image_dir = os.path.join(args.base_output_dir, os.path.relpath(args.image_dir, "."))
+        args.pdf_dir = apply_base_dir(args.pdf_dir, args.base_output_dir)
+        args.md_dir = apply_base_dir(args.md_dir, args.base_output_dir)
+        args.out_jsonl = apply_base_dir(args.out_jsonl, args.base_output_dir)
+        args.issues_out = apply_base_dir(args.issues_out, args.base_output_dir)
+        args.image_dir = apply_base_dir(args.image_dir, args.base_output_dir)
 
     rows = load_csv(args.csv_in)
     if args.top_k and args.top_k > 0:

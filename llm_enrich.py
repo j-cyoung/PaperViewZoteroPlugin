@@ -7,6 +7,7 @@ import re
 import argparse
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Condition
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -135,6 +136,67 @@ class TaskSpec:
     temperature: float = 0.0
     system_prompt: Optional[str] = None
     response_format: Optional[Dict[str, Any]] = None
+
+
+class RateLimitController:
+    def __init__(self, max_inflight: int, wait_s: int):
+        self.default_max = max(1, max_inflight)
+        self.max_inflight = self.default_max
+        self.in_flight = 0
+        self.pause_until = 0.0
+        self.rate_limited = False
+        self.wait_s = max(1, int(wait_s))
+        self.waiting_logged = False
+        self.cond = Condition()
+
+    def acquire(self) -> None:
+        with self.cond:
+            while True:
+                now = time.time()
+                if self.pause_until and now < self.pause_until:
+                    wait_s = self.pause_until - now
+                    if not self.waiting_logged:
+                        self.waiting_logged = True
+                        tqdm.write(
+                            f"[rate-limit] waiting {int(wait_s)}s, concurrency={self.max_inflight}"
+                        )
+                    self.cond.wait(timeout=wait_s)
+                    continue
+                if self.pause_until and now >= self.pause_until:
+                    self.pause_until = 0.0
+                    self.waiting_logged = False
+                if self.in_flight < self.max_inflight:
+                    self.in_flight += 1
+                    return
+                self.cond.wait()
+
+    def release(self) -> None:
+        with self.cond:
+            self.in_flight = max(0, self.in_flight - 1)
+            self.cond.notify_all()
+
+    def on_rate_limit(self) -> None:
+        with self.cond:
+            self.rate_limited = True
+            self.max_inflight = 1
+            now = time.time()
+            self.pause_until = max(self.pause_until, now + self.wait_s)
+            self.waiting_logged = False
+            self.cond.notify_all()
+            tqdm.write(
+                f"[rate-limit] 429 detected, pause {self.wait_s}s, "
+                f"concurrency set to 1"
+            )
+
+    def on_success(self) -> None:
+        with self.cond:
+            if self.rate_limited and time.time() >= self.pause_until:
+                self.rate_limited = False
+                self.max_inflight = self.default_max
+                self.cond.notify_all()
+                tqdm.write(
+                    f"[rate-limit] recovered, concurrency={self.default_max}"
+                )
 
 
 def ensure_ids(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -337,17 +399,25 @@ def main() -> None:
     ap.add_argument("--resume_from", default="", help="Optional prior output jsonl")
     ap.add_argument("--top_k", type=int, default=0, help="只处理前K条（0=全部）")
     ap.add_argument("--concurrency", type=int, default=1, help="并发请求数量")
+    ap.add_argument("--retry_on_429", action="store_true", default=False, help="遇到429时持续重试")
+    ap.add_argument("--retry_wait_s", type=int, default=300, help="429重试等待秒数")
 
     args = ap.parse_args()
 
+    def apply_base_dir(path: str, base_dir: str) -> str:
+        if not base_dir or os.path.isabs(path):
+            return path
+        base_norm = os.path.normpath(base_dir)
+        path_norm = os.path.normpath(path)
+        if path_norm == base_norm or path_norm.startswith(base_norm + os.sep):
+            return path
+        return os.path.join(base_dir, path)
+
     if args.base_output_dir:
         os.makedirs(os.path.dirname(args.base_output_dir), exist_ok=True)
-        if not os.path.isabs(args.out_jsonl):
-            args.out_jsonl = os.path.join(args.base_output_dir, os.path.relpath(args.out_jsonl, "."))
-        if not os.path.isabs(args.out_csv):
-            args.out_csv = os.path.join(args.base_output_dir, os.path.relpath(args.out_csv, "."))
-        if not os.path.isabs(args.issues_out):
-            args.issues_out = os.path.join(args.base_output_dir, os.path.relpath(args.issues_out, "."))
+        args.out_jsonl = apply_base_dir(args.out_jsonl, args.base_output_dir)
+        args.out_csv = apply_base_dir(args.out_csv, args.base_output_dir)
+        args.issues_out = apply_base_dir(args.issues_out, args.base_output_dir)
 
     csv_path = resolve_default_path(args.csv_in, "./store/enrich/papers.enriched.csv")
     compute_path = resolve_default_path(args.compute_jsonl, "./store/compute/gpu_compute.jsonl")
@@ -422,14 +492,29 @@ def main() -> None:
             prompt = task.prompt_template.format(**prompt_vars)
 
             start_ts = time.time()
+            retries = 0
             try:
-                resp = provider.generate(
-                    prompt=prompt,
-                    system=task.system_prompt,
-                    temperature=task.temperature,
-                    max_output_tokens=task.max_output_tokens,
-                    response_format=task.response_format,
-                )
+                while True:
+                    rate_state.acquire()
+                    try:
+                        resp = provider.generate(
+                            prompt=prompt,
+                            system=task.system_prompt,
+                            temperature=task.temperature,
+                            max_output_tokens=task.max_output_tokens,
+                            response_format=task.response_format,
+                        )
+                        rate_state.on_success()
+                        break
+                    except requests.HTTPError as e:
+                        status = getattr(e.response, "status_code", None)
+                        if status == 429 and args.retry_on_429:
+                            retries += 1
+                            rate_state.on_rate_limit()
+                            continue
+                        raise
+                    finally:
+                        rate_state.release()
                 elapsed_ms = int((time.time() - start_ts) * 1000)
                 out[task.model_field] = resp.model
                 out[task.usage_field] = {
@@ -460,6 +545,7 @@ def main() -> None:
                     "model": resp.model,
                     "status": out.get(task.status_field),
                     "elapsed_ms": elapsed_ms,
+                    "retries": retries,
                     "prompt_tokens": resp.usage.prompt_tokens,
                     "output_tokens": resp.usage.output_tokens,
                     "total_tokens": resp.usage.total_tokens,
@@ -475,6 +561,7 @@ def main() -> None:
                     "model": out.get(task.model_field),
                     "status": "error",
                     "elapsed_ms": elapsed_ms,
+                    "retries": retries,
                     "prompt_tokens": None,
                     "output_tokens": None,
                     "total_tokens": None,
@@ -484,6 +571,7 @@ def main() -> None:
         return {"idx": idx, "data": out}
 
     results: List[Dict[str, Any]] = [None] * len(rows_iter)
+    rate_state = RateLimitController(args.concurrency, args.retry_wait_s)
     with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as ex:
         futures = [ex.submit(process_one, i, row) for i, row in enumerate(rows_iter)]
         for fut in tqdm(as_completed(futures), total=len(futures), desc="LLM enrich", unit="paper"):

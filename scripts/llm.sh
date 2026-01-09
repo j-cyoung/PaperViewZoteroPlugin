@@ -20,4 +20,5 @@ python llm_enrich.py \
   --base_url "https://api.siliconflow.cn/v1" \
   --resume \
   --resume_from "${base_output_dir}/papers.llm.jsonl" \
+  --retry_on_429 \
   --concurrency 1

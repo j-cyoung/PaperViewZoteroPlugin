@@ -417,18 +417,22 @@ def main():
     ap.add_argument("--base_output_dir", default="./store/enrich", help="输出根目录（相对路径会拼接到该目录）")
     args = ap.parse_args()
 
+    def apply_base_dir(path: str, base_dir: str) -> str:
+        if not base_dir or os.path.isabs(path):
+            return path
+        base_norm = os.path.normpath(base_dir)
+        path_norm = os.path.normpath(path)
+        if path_norm == base_norm or path_norm.startswith(base_norm + os.sep):
+            return path
+        return os.path.join(base_dir, path)
+
     if args.base_output_dir:
         os.makedirs(os.path.dirname(args.base_output_dir), exist_ok=True)
-        if not os.path.isabs(args.out_csv):
-            args.out_csv = os.path.join(args.base_output_dir, os.path.relpath(args.out_csv, "."))
-        if not os.path.isabs(args.out_jsonl):
-            args.out_jsonl = os.path.join(args.base_output_dir, os.path.relpath(args.out_jsonl, "."))
-        if not os.path.isabs(args.pdf_dir):
-            args.pdf_dir = os.path.join(args.base_output_dir, os.path.relpath(args.pdf_dir, "."))
-        if not os.path.isabs(args.cache):
-            args.cache = os.path.join(args.base_output_dir, os.path.relpath(args.cache, "."))
-        if not os.path.isabs(args.issues_out):
-            args.issues_out = os.path.join(args.base_output_dir, os.path.relpath(args.issues_out, "."))
+        args.out_csv = apply_base_dir(args.out_csv, args.base_output_dir)
+        args.out_jsonl = apply_base_dir(args.out_jsonl, args.base_output_dir)
+        args.pdf_dir = apply_base_dir(args.pdf_dir, args.base_output_dir)
+        args.cache = apply_base_dir(args.cache, args.base_output_dir)
+        args.issues_out = apply_base_dir(args.issues_out, args.base_output_dir)
 
     rows = load_csv(args.csv_in)
     cache = load_cache(args.cache)
