@@ -1,0 +1,5 @@
+mds/*
+pdfs/*
+*.csv
+*.jsonl
+*.pdf
