@@ -493,10 +493,19 @@ def main() -> None:
     issues: List[Dict[str, Any]] = []
     for out in results:
         if any(out.get(t.status_field) not in {None, "ok"} for t in tasks):
+            reasons = []
+            for t in tasks:
+                if out.get(t.status_field) not in {None, "ok"}:
+                    msg = out.get(t.error_field) or out.get(f"{t.name}_error") or ""
+                    if msg:
+                        reasons.append(f"{t.name}: {msg}")
+                    else:
+                        reasons.append(f"{t.name}: {out.get(t.status_field)}")
             issues.append({
                 "paper_id": out.get("paper_id"),
                 "title": out.get("title"),
                 "status": "error",
+                "reason": " | ".join(reasons),
             })
 
     write_jsonl(args.out_jsonl, results)
@@ -542,7 +551,7 @@ def main() -> None:
     write_csv(args.out_csv, summary_rows, preferred_fields=preferred)
 
     if issues:
-        write_csv(args.issues_out, issues, preferred_fields=["paper_id", "title", "status"])
+        write_csv(args.issues_out, issues, preferred_fields=["paper_id", "title", "status", "reason"])
 
     print(f"Done. JSONL -> {args.out_jsonl}, CSV -> {args.out_csv}")
     if issues:
