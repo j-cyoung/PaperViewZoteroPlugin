@@ -1,0 +1,14 @@
+{
+  "manifest_version": 2,
+  "name": "PaperView Query",
+  "version": "0.0.1",
+  "description": "Minimal Zotero 8 demo: right-click Query menu",
+  "applications": {
+    "zotero": {
+      "id": "paperview-query@local",
+      "strict_min_version": "8.0",
+      "strict_max_version": "8.*",
+      "update_url": "https://example.com/paperview/updates.json"
+    }
+  }
+}

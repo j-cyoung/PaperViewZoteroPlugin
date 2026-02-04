@@ -8,3 +8,4 @@ backup/*
 store/*
 store
 __pycache__/
+tmp
