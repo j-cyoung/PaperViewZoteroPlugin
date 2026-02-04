@@ -1,108 +1,160 @@
-## PaperView
+# PaperView
 
-这是一个简单的论文处理流水线项目：从论文列表解析元信息，检索摘要与下载 PDF，PDF 转 Markdown，抽取算力线索，并用 LLM 做翻译与结构化总结。
+## 中文
 
-访问 https://j-cyoung.github.io/Embodied-AI-Paper-TopConf-Pages/ 查看可视化结果
+**项目简介**
+PaperView 是一个面向论文检索与批处理的本地流水线项目，集成 Zotero 插件用于选中文献发起查询，并在本地服务中完成 OCR、LLM 查询与结果可视化。
 
-### 数据来源声明
-本项目的论文列表基于：  
-https://github.com/Songwxuan/Embodied-AI-Paper-TopConf
+**功能概览**
+- Zotero 右键菜单 `Query` 发起查询
+- 可选查询章节（如 `abstract`、`introduction`、`methods`）
+- 不指定章节时默认查询全文（`full_text`）
+- 进度条展示查询状态
+- 结果页面支持历史查询切换
+- OCR 缓存与增量更新（复用已生成结果）
 
-### 项目定位
-- 论文可视化 pipeline（用于快速整理与分析）
-- 面向批量处理与增量更新（支持 resume）
+**环境要求**
+- macOS
+- Zotero 8.x
+- Python 3.10+（推荐用 `uv`）
+- LLM API Key（`SILICONFLOW_API_KEY` 或 `OPENAI_API_KEY`）
 
-### 核心脚本
-- `parse_paperlist.py`：解析论文列表 Markdown，生成结构化 CSV/JSONL
-- `enrich_papers.py`：补全元信息并下载 PDF
-- `pdf_to_md_pymupdf4llm.py`：PDF 转 Markdown
-- `extract_compute_from_pages.py`：从 Markdown 中提取算力相关线索
-- `llm_enrich.py`：LLM 翻译摘要 + 结构化算力总结
-- `query_papers.py`：基于论文内容进行LLM查询（支持指定章节）
-
-### 一键查询功能
-
-`query_papers.py` 支持对论文进行智能查询，可以指定论文的不同章节（如 abstract、introduction、methods 等），然后通过 LLM 回答你的问题。
-
-#### 功能特点
-- ✅ 支持指定论文的不同部分和组合（abstract、introduction、methods、experiments、conclusion 等）
-- ✅ 章节名称支持模糊搜索（如 "related work" 可匹配 "Related Work"、"Preliminary"、"Background" 等）
-- ✅ 大小写不敏感
-- ✅ **支持按标题关键字筛选论文**（如：`--filter_title data` 只查询标题包含 "data" 的论文）
-- ✅ 支持限制查询数量，避免消耗过多 API 金额
-- ✅ 支持 resume 模式，可从中断处继续
-- ✅ 自动提取章节内容并构造 prompt
-- ✅ **输出多种格式**：JSONL、CSV 和 Markdown
-
-#### 使用方法
-
-**使用 Python 脚本：**
+**快速开始**
+1. 启动后端服务（推荐端口 20341）
 ```bash
-# 查询 abstract 和 introduction 章节
-python query_papers.py \
-    --sections abstract,introduction \
-    --question "这篇论文的主要贡献是什么？" \
-    --top_k 5
-
-# 按标题关键字筛选 + 查询 methods 章节
-python query_papers.py \
-    --sections methods \
-    --question "这篇论文使用了什么方法？" \
-    --filter_title data \
-    --top_k 10
-
-# 继续之前的查询（resume 模式）
-python query_papers.py \
-    --sections abstract \
-    --question "..." \
-    --resume
+uv run python local_service.py --port 20341
 ```
-
-**使用 Shell 脚本（简单示例）：**
+2. 打包插件并安装
 ```bash
-# 直接运行脚本（修改脚本中的参数）
-./scripts/query.sh
+./scripts/build_xpi.sh
 ```
+3. 在 Zotero 插件管理器中拖入 `paperview-query.xpi` 安装
+4. 设置服务地址：Zotero 顶部菜单 `Tools` → `PaperView: Set Service URL`
+   例如：`http://127.0.0.1:20341`
+5. 在 Zotero 文献列表中右键选择 `Query` 发起查询
 
-### 翻译摘要与引言（Shell 脚本）
+**查询输入格式**
+- 直接输入问题（默认全文）：
+  `请总结方法`
+- 指定章节：
+  `[method] 总结方法`
+  `[abstract,introduction] 请翻译成英文`
 
-脚本：`./scripts/query_abs_intro_trans.sh`
-
-- 默认输出到：`./store/query/translation/abs_intro/`
-- 常用覆盖参数（环境变量）：`FILTER_TITLE`、`TOP_K`、`MODEL_NAME`、`CONCURRENCY`、`MAX_OUTPUT_TOKENS`
-
-示例：
-```bash
-FILTER_TITLE=data TOP_K=5 ./scripts/query_abs_intro_trans.sh
-```
-
-### query 结果可视化（本地网页）
-
-打开 `query_view.html`，加载 `papers.query.jsonl`（或任意 `papers.*.jsonl`）。
-
-如果希望网页自动读取默认路径（如 `./store/query/comparison/papers.query.jsonl`），建议在仓库根目录启动静态服务：
-```bash
-python -m http.server 8000
-```
-然后访问：`http://localhost:8000/query_view.html`
-
-#### 支持的章节名称
+**章节名称示例**
 - `abstract` / `摘要`
 - `introduction` / `引言`
-- `related_work` / `related work` / `preliminary` / `background` / `相关工作`
-- `methods` / `method` / `methodology` / `approach` / `方法`
-- `experiments` / `experiment` / `evaluation` / `results` / `实验`
-- `conclusion` / `conclusions` / `discussion` / `总结`
+- `related_work` / `background` / `相关工作`
+- `methods` / `method` / `approach` / `方法`
+- `experiments` / `evaluation` / `results` / `实验`
+- `conclusion` / `discussion` / `总结`
+- `full_text` / `全文` / `全部`
 
-#### 输出文件
-- `papers.query.jsonl`：完整的查询结果（JSONL 格式）
-- `papers.query.csv`：查询结果摘要（CSV 格式，便于查看）
-- `papers.query.md`：**Markdown 格式报告**（便于阅读和分享）
-- `papers.query_issues.csv`：错误报告（如有）
+**数据与结果路径**
+- `store/zotero/items.jsonl`：Zotero 元信息快照
+- `store/zotero/items.csv`：OCR 输入
+- `store/zotero/ocr/papers.pages.jsonl`：OCR 输出
+- `store/zotero/query/<job_id>/`：查询结果与中间文件
 
-#### 注意事项
-- 需要设置 API 密钥：通过环境变量 `SILICONFLOW_API_KEY` 或 `OPENAI_API_KEY`，或使用 `--api_key` 参数
-- 默认使用 `Qwen/Qwen2.5-72B-Instruct` 模型，可通过 `--model` 参数修改
-- 建议先用 `--top_k` 参数测试少量论文，确认效果后再批量查询
-- 使用 `--resume` 可以从中断处继续，避免重复查询已处理的论文
-- 使用 `--filter_title` 可以按标题关键字筛选论文，减少不必要的 API 调用
+**OCR 流程**
+```bash
+./scripts/ocr_from_zotero.sh
+```
+输出：`store/zotero/ocr/papers.pages.jsonl`
+
+**结果可视化**
+- 查询完成后自动打开 `http://127.0.0.1:20341/result/<job_id>`
+- 历史查询页面：`http://127.0.0.1:20341/query_view.html`
+
+**配置项**
+- 服务地址：`Tools` → `PaperView: Set Service URL`
+- 本地服务端口：`local_service.py --port <PORT>`（默认 23119）
+
+**常见问题**
+- 端口被占用：`lsof -nP -iTCP:20341 -sTCP:LISTEN` 后 `kill <PID>`
+- 浏览器未自动打开：检查服务是否运行、端口是否一致
+- 查询进度不更新：确认 `local_service.py` 与 `query_papers.py` 已更新
+
+**许可证**
+- MIT License（见 `LICENSE`）
+
+**项目说明**
+- 本项目诞生于我对文献进行批量查询的需求（比如查询每篇文章使用了什么样的算力等），用于前期的文献调研、文献综述（帮老师写本子）等任务。完全通过vibe coding开发，随缘更新与迭代～
+
+---
+
+## English
+
+**Overview**
+PaperView is a local pipeline for paper retrieval and batch analysis. It integrates a Zotero plugin to trigger queries, runs OCR and LLM querying in a local service, and visualizes results in a web page.
+
+**Key Features**
+- Zotero context menu `Query`
+- Optional section targeting (`abstract`, `introduction`, `methods`)
+- Defaults to full text (`full_text`) when no section is specified
+- Progress window during query
+- History page to switch between past queries
+- OCR caching with incremental updates
+
+**Requirements**
+- macOS
+- Zotero 8.x
+- Python 3.10+ (recommended with `uv`)
+- LLM API Key (`SILICONFLOW_API_KEY` or `OPENAI_API_KEY`)
+
+**Quick Start**
+1. Start the backend service (recommended port 20341)
+```bash
+uv run python local_service.py --port 20341
+```
+2. Build and install the plugin
+```bash
+./scripts/build_xpi.sh
+```
+3. Drag `paperview-query.xpi` into Zotero’s Add-ons manager
+4. Set the service URL in Zotero: `Tools` → `PaperView: Set Service URL`
+   Example: `http://127.0.0.1:20341`
+5. Right-click items in Zotero and choose `Query`
+
+**Query Input Format**
+- Direct question (defaults to full text):
+  `Summarize the method`
+- With section prefix:
+  `[method] Summarize the method`
+  `[abstract,introduction] Please translate to English`
+
+**Section Names**
+- `abstract`
+- `introduction`
+- `related_work` / `background`
+- `methods` / `method` / `approach`
+- `experiments` / `evaluation` / `results`
+- `conclusion` / `discussion`
+- `full_text` / `all`
+
+**Data Paths**
+- `store/zotero/items.jsonl` ingest snapshot
+- `store/zotero/items.csv` OCR input
+- `store/zotero/ocr/papers.pages.jsonl` OCR output
+- `store/zotero/query/<job_id>/` query outputs
+
+**OCR Pipeline**
+```bash
+./scripts/ocr_from_zotero.sh
+```
+Output: `store/zotero/ocr/papers.pages.jsonl`
+
+**Visualization**
+- Result page: `http://127.0.0.1:20341/result/<job_id>`
+- History page: `http://127.0.0.1:20341/query_view.html`
+
+**Configuration**
+- Service URL: `Tools` → `PaperView: Set Service URL`
+- Service port: `local_service.py --port <PORT>` (default 23119)
+
+**Troubleshooting**
+- Port in use: `lsof -nP -iTCP:20341 -sTCP:LISTEN` then `kill <PID>`
+- Browser not opening: verify service is running and URL matches
+- Progress not updating: ensure `local_service.py` and `query_papers.py` are updated
+
+**License**
+- MIT License (see `LICENSE`)
