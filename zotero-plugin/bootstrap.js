@@ -3,6 +3,21 @@
 var menuRegistrationID = null;
 var pluginID = null;
 var FTL_FILE = "paperview.ftl";
+var SERVICE_BASE_URL = "http://127.0.0.1:20341";
+
+async function queryService(itemKeys) {
+  const payload = { item_keys: itemKeys };
+  const resp = await Zotero.HTTP.request("POST", `${SERVICE_BASE_URL}/query`, {
+    body: JSON.stringify(payload),
+    headers: { "Content-Type": "application/json" }
+  });
+  const text = resp.responseText || resp.response || "";
+  const data = JSON.parse(text);
+  if (!data || !data.result_url) {
+    throw new Error("Missing result_url in response");
+  }
+  Zotero.launchURL(data.result_url);
+}
 
 function insertFTL(win) {
   try {
@@ -24,7 +39,7 @@ function registerMenu(pluginID) {
       {
         menuType: "menuitem",
         l10nID: "paperview-menu-query",
-        onCommand: (event, context) => {
+        onCommand: async (event, context) => {
           try {
             const items =
               context && context.items && context.items.length
@@ -34,6 +49,7 @@ function registerMenu(pluginID) {
             Zotero.debug(
               `[PaperView] Selected ${keys.length} item(s): ${keys.join(", ")}`
             );
+            await queryService(keys);
           } catch (err) {
             Zotero.debug(`[PaperView] onCommand error: ${err}`);
           }
