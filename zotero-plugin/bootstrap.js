@@ -3,13 +3,33 @@
 var pluginID = null;
 var SERVICE_BASE_URL = "http://127.0.0.1:20341";
 var LAST_QUERY_SECTIONS = "full_text";
+var PREF_SERVICE_URL = "extensions.paperview.service_base_url";
 var cleanupHandlers = [];
 
 function getServiceBaseUrl() {
+  try {
+    if (Zotero.Prefs && typeof Zotero.Prefs.get === "function") {
+      const pref = Zotero.Prefs.get(PREF_SERVICE_URL);
+      if (pref && typeof pref === "string") return pref;
+    }
+  } catch (err) {
+    // ignore pref errors
+  }
   if (SERVICE_BASE_URL && typeof SERVICE_BASE_URL === "string") {
     return SERVICE_BASE_URL;
   }
   return "http://127.0.0.1:20341";
+}
+
+function setServiceBaseUrl(value) {
+  SERVICE_BASE_URL = value;
+  try {
+    if (Zotero.Prefs && typeof Zotero.Prefs.set === "function") {
+      Zotero.Prefs.set(PREF_SERVICE_URL, value);
+    }
+  } catch (err) {
+    // ignore pref errors
+  }
 }
 
 function getStoredPdfAttachment(item) {
@@ -150,7 +170,61 @@ async function queryService(itemKeys, queryText, sectionsText) {
   if (!data || !data.result_url) {
     throw new Error("Missing result_url in response");
   }
-  Zotero.launchURL(data.result_url);
+  return data;
+}
+
+async function showQueryProgress(jobId, resultUrl) {
+  const baseUrl = getServiceBaseUrl();
+  const win = Zotero.getMainWindow();
+  const pw = new Zotero.ProgressWindow({ closeOnClick: false });
+  pw.changeHeadline("PaperView 查询中");
+  const icon = `chrome://zotero/skin/treesource-unfiled${Zotero.hiDPI ? "@2x" : ""}.png`;
+  const progress = new pw.ItemProgress(icon, "准备中...");
+  progress.setProgress(0);
+  pw.show();
+
+  let stopped = false;
+  const update = async () => {
+    if (stopped) return;
+    try {
+      const resp = await Zotero.HTTP.request("GET", `${baseUrl}/status/${jobId}`, {
+        headers: { "Content-Type": "application/json" }
+      });
+      const text = resp.responseText || resp.response || "";
+      const data = JSON.parse(text);
+      const stage = data.stage || "query";
+      const done = Number(data.done || 0);
+      const total = Number(data.total || 0);
+      const msg = data.message ? ` ${data.message}` : "";
+      let percent = 0;
+      if (total > 0) {
+        percent = Math.min(100, Math.round((done * 100) / total));
+      } else if (stage === "done") {
+        percent = 100;
+      }
+      progress.setProgress(percent);
+      progress.setText(`${stage} ${total > 0 ? `${done}/${total}` : ""}${msg}`.trim());
+      if (stage === "done") {
+        progress.setProgress(100);
+        progress.setText("完成");
+        stopped = true;
+        win.clearInterval(timer);
+        pw.close();
+        Zotero.launchURL(resultUrl);
+      }
+      if (stage === "error") {
+        progress.setProgress(100);
+        progress.setText(`失败${msg}`);
+        stopped = true;
+        win.clearInterval(timer);
+      }
+    } catch (err) {
+      progress.setText("等待服务响应...");
+    }
+  };
+
+  const timer = win.setInterval(update, 1000);
+  update();
 }
 
 function attachMenuToWindow(win) {
@@ -183,7 +257,12 @@ function attachMenuToWindow(win) {
           const sectionsText = "";
           const ingest = await ingestItems(items);
           Zotero.debug(`[PaperView] Ingested: ${JSON.stringify(ingest)}`);
-          await queryService(keys, queryText, sectionsText);
+          const result = await queryService(keys, queryText, sectionsText);
+          if (result && result.job_id && result.result_url) {
+            await showQueryProgress(result.job_id, result.result_url);
+          } else if (result && result.result_url) {
+            Zotero.launchURL(result.result_url);
+          }
         } catch (err) {
           Zotero.debug(`[PaperView] onCommand error: ${err}`);
         }
@@ -235,11 +314,49 @@ function attachMenuToWindow(win) {
   }
 }
 
+function attachToolsMenuToWindow(win) {
+  try {
+    if (!win || !win.document) return;
+    const doc = win.document;
+    const toolsMenu = doc.getElementById("menu_ToolsPopup");
+    if (!toolsMenu) return;
+
+    let settingsItem = doc.getElementById("paperview-tools-settings");
+    if (!settingsItem) {
+      settingsItem = doc.createXULElement
+        ? doc.createXULElement("menuitem")
+        : doc.createElement("menuitem");
+      settingsItem.setAttribute("id", "paperview-tools-settings");
+      settingsItem.setAttribute("label", "PaperView: Set Service URL");
+      const onSettings = () => {
+        try {
+          const current = getServiceBaseUrl();
+          const input = win.prompt("请输入服务地址（如 http://127.0.0.1:20341）", current);
+          if (!input) return;
+          setServiceBaseUrl(input.trim());
+          Zotero.debug(`[PaperView] service_base_url set to ${getServiceBaseUrl()}`);
+        } catch (err) {
+          Zotero.debug(`[PaperView] settings error: ${err}`);
+        }
+      };
+      settingsItem.addEventListener("command", onSettings);
+      toolsMenu.appendChild(settingsItem);
+      cleanupHandlers.push(() => {
+        settingsItem.removeEventListener("command", onSettings);
+        if (settingsItem.parentNode) settingsItem.parentNode.removeChild(settingsItem);
+      });
+    }
+  } catch (err) {
+    Zotero.debug(`[PaperView] attachToolsMenuToWindow error: ${err}`);
+  }
+}
+
 function initMenus() {
   try {
     const windows = Zotero.getMainWindows();
     for (const win of windows) {
       attachMenuToWindow(win);
+      attachToolsMenuToWindow(win);
     }
   } catch (err) {
     Zotero.debug(`[PaperView] initMenus error: ${err}`);
@@ -268,4 +385,5 @@ function uninstall() {}
 
 function onMainWindowLoad({ window }) {
   attachMenuToWindow(window);
+  attachToolsMenuToWindow(window);
 }

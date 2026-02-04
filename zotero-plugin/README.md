@@ -10,6 +10,7 @@
 - 点击后在 Zotero 调试输出中打印选中条目的 item key
 - 向本地服务 `/ingest` 发送元信息与 PDF 路径（仅存储型附件）
 - 调用 `/query` 并打开返回的 `result_url`
+- 查询过程中显示进度条（轮询本地服务 `/status/<job_id>`）
 
 ## 编译与安装（打包成 .xpi）
 1. 在仓库根目录执行以下命令生成安装包：
@@ -24,10 +25,14 @@
 在仓库根目录启动本地服务：
 
 ```bash
-python local_service.py --port 23119
+uv run python local_service.py --port 20341
 ```
 
 服务启动后，右键点击 `Query` 会打开本地演示页面。
+
+### 配置服务地址（端口）
+在 Zotero 顶部菜单：`Tools` → `PaperView: Set Service URL`  
+例如：`http://127.0.0.1:20341`
 
 ### 数据落盘位置
 `/ingest` 接收到的数据会覆盖写入：`store/zotero/items.jsonl`

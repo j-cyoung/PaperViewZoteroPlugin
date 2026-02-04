@@ -6,6 +6,8 @@ import json
 import subprocess
 import uuid
 import re
+import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -156,6 +158,31 @@ class DemoHandler(BaseHTTPRequestHandler):
         job_dir.mkdir(parents=True, exist_ok=True)
         return job_dir
 
+    def _status_path(self, job_dir):
+        return job_dir / "status.json"
+
+    def _write_status(self, job_dir, stage, done=None, total=None, message=None):
+        payload = {
+            "stage": stage,
+            "done": done,
+            "total": total,
+            "message": message,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._status_path(job_dir).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _read_status(self, job_id):
+        job_dir = self._query_dir() / job_id
+        path = self._status_path(job_dir)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
     def _history_entries(self):
         query_dir = self._query_dir()
         if not query_dir.exists():
@@ -200,7 +227,7 @@ class DemoHandler(BaseHTTPRequestHandler):
         )
         self._write_jsonl(job_dir / "items.jsonl", items)
 
-    def _run_query_pipeline(self, payload):
+    def _run_query_pipeline(self, payload, job_id):
         item_keys = payload.get("item_keys") or []
         query_text = payload.get("query") or ""
         sections = payload.get("sections")
@@ -228,8 +255,8 @@ class DemoHandler(BaseHTTPRequestHandler):
         if not item_keys or not query_text:
             raise ValueError("missing item_keys or query text")
 
-        job_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
         job_dir = self._query_job_dir(job_id)
+        self._write_status(job_dir, "queued", 0, len(item_keys) or 0)
 
         items_path = self._items_jsonl()
         if not items_path.exists():
@@ -238,33 +265,70 @@ class DemoHandler(BaseHTTPRequestHandler):
         selected = [item for item in items if item.get("item_key") in set(item_keys)]
         if not selected:
             raise ValueError("no matching items in items.jsonl")
+
+        self._write_status(job_dir, "prepare", 0, len(selected))
         self._write_query_snapshot(job_dir, payload, selected)
 
         # ensure OCR cache (incremental)
+        self._write_status(job_dir, "ocr", 0, len(selected))
         self._ensure_ocr_cache()
+        self._write_status(job_dir, "ocr", len(selected), len(selected))
 
         # filter OCR pages for selected items
         filtered_pages = job_dir / "pages.selected.jsonl"
         self._filter_pages(item_keys, filtered_pages)
 
-        # run query on selected pages
-        self._run_cmd(
-            [
-                "uv",
-                "run",
-                "python",
-                "query_papers.py",
-                "--pages_jsonl",
-                str(filtered_pages),
-                "--base_output_dir",
-                str(job_dir),
-                "--question",
-                query_text,
-                "--sections",
-                sections,
-            ],
-            cwd=self._base_dir(),
-        )
+        # run query on selected pages with progress
+        self._write_status(job_dir, "query", 0, len(selected))
+        out_jsonl = job_dir / "papers.query.jsonl"
+        progress_path = job_dir / "progress.json"
+        cmd = [
+            "uv",
+            "run",
+            "python",
+            "query_papers.py",
+            "--pages_jsonl",
+            str(filtered_pages),
+            "--base_output_dir",
+            str(job_dir),
+            "--question",
+            query_text,
+            "--sections",
+            sections,
+            "--progress_path",
+            str(progress_path),
+        ]
+        proc = subprocess.Popen(cmd, cwd=self._base_dir())
+        while proc.poll() is None:
+            done = 0
+            total = len(selected)
+            if progress_path.exists():
+                try:
+                    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+                    done = int(progress.get("done") or 0)
+                    total = int(progress.get("total") or total)
+                except Exception:
+                    done = 0
+            elif out_jsonl.exists():
+                with out_jsonl.open("r", encoding="utf-8") as f:
+                    done = sum(1 for line in f if line.strip())
+            self._write_status(job_dir, "query", done, total)
+            time.sleep(1)
+        if proc.returncode != 0:
+            raise RuntimeError(f"query_papers failed with code {proc.returncode}")
+        done = 0
+        total = len(selected)
+        if progress_path.exists():
+            try:
+                progress = json.loads(progress_path.read_text(encoding="utf-8"))
+                done = int(progress.get("done") or done)
+                total = int(progress.get("total") or total)
+            except Exception:
+                done = 0
+        elif out_jsonl.exists():
+            with out_jsonl.open("r", encoding="utf-8") as f:
+                done = sum(1 for line in f if line.strip())
+        self._write_status(job_dir, "done", done, total)
         return job_id
 
     def _serve_query_result(self, job_id):
@@ -285,6 +349,12 @@ class DemoHandler(BaseHTTPRequestHandler):
             return self._send_json(200, {"history": self._history_entries()})
         if path == "/query_view.html":
             return self._serve_query_view()
+        if path.startswith("/status/"):
+            job_id = path.split("/status/")[-1].strip("/")
+            status = self._read_status(job_id)
+            if not status:
+                return self._send_json(404, {"error": "not found"})
+            return self._send_json(200, status)
         if path.startswith("/result/"):
             job_id = path.split("/result/")[-1].strip("/")
             if job_id == "demo":
@@ -323,11 +393,18 @@ class DemoHandler(BaseHTTPRequestHandler):
             item_keys = payload.get("item_keys") or []
             if query_text:
                 print(f"[query] {query_text} | items={len(item_keys)}")
-            try:
-                job_id = self._run_query_pipeline(payload)
-            except Exception as e:
-                return self._send_json(500, {"error": str(e)})
+            job_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
+            job_dir = self._query_job_dir(job_id)
+            self._write_status(job_dir, "queued", 0, len(item_keys) or 0)
             result_url = f"http://localhost:{self.server.server_address[1]}/result/{job_id}"
+
+            def run_job():
+                try:
+                    self._run_query_pipeline(payload, job_id)
+                except Exception as e:
+                    self._write_status(job_dir, "error", 0, len(item_keys) or 0, str(e))
+
+            threading.Thread(target=run_job, daemon=True).start()
             return self._send_json(200, {"result_url": result_url, "job_id": job_id})
         if self.path == "/ingest":
             try:

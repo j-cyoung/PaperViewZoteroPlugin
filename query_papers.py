@@ -482,6 +482,8 @@ def main() -> None:
                     help="输出Markdown文件路径")
     ap.add_argument("--issues_out", default="papers.query_issues.csv",
                     help="错误报告CSV文件路径")
+    ap.add_argument("--progress_path", default="",
+                    help="进度文件路径（可选，JSON格式，包含done/total）")
     ap.add_argument("--base_output_dir", default="./store/query",
                     help="输出根目录（相对路径会拼接到该目录）")
     
@@ -538,6 +540,22 @@ def main() -> None:
         args.out_csv = apply_base_dir(args.out_csv, args.base_output_dir)
         args.out_md = apply_base_dir(args.out_md, args.base_output_dir)
         args.issues_out = apply_base_dir(args.issues_out, args.base_output_dir)
+        if args.progress_path:
+            args.progress_path = apply_base_dir(args.progress_path, args.base_output_dir)
+
+    def write_progress(done: int, total: int):
+        if not args.progress_path:
+            return
+        payload = {
+            "done": done,
+            "total": total,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        try:
+            with open(args.progress_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            pass
     
     # 解析章节列表
     section_names = [s.strip() for s in args.sections.split(",") if s.strip()]
@@ -699,11 +717,15 @@ def main() -> None:
     
     # 处理所有论文
     results: List[Dict[str, Any]] = [None] * len(papers)
+    write_progress(0, len(papers))
     with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as ex:
         futures = [ex.submit(process_one, i, paper) for i, paper in enumerate(papers)]
         for fut in tqdm(as_completed(futures), total=len(futures), desc="查询论文", unit="篇"):
             res = fut.result()
             results[res["idx"]] = res["data"]
+            done = sum(1 for r in results if r is not None)
+            write_progress(done, len(papers))
+    write_progress(len(papers), len(papers))
     
     # 保存结果
     write_jsonl(args.out_jsonl, results)
