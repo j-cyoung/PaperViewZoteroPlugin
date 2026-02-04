@@ -3,7 +3,9 @@
 
 import argparse
 import json
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 
 class DemoHandler(BaseHTTPRequestHandler):
@@ -30,6 +32,23 @@ class DemoHandler(BaseHTTPRequestHandler):
         port = self.server.server_address[1]
         return f"http://{host}:{port}/result/demo"
 
+    def _write_ingest(self, items):
+        base_dir = Path(__file__).resolve().parent
+        store_dir = base_dir / "store" / "zotero"
+        store_dir.mkdir(parents=True, exist_ok=True)
+        out_file = store_dir / "items.jsonl"
+        now = datetime.now(timezone.utc).isoformat()
+        lines = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item.setdefault("ingest_time", now)
+            lines.append(json.dumps(item, ensure_ascii=False))
+        if lines:
+            with out_file.open("w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        return len(lines)
+
     def do_GET(self):
         if self.path == "/health":
             return self._send_json(200, {"ok": True})
@@ -49,12 +68,28 @@ class DemoHandler(BaseHTTPRequestHandler):
         return self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/query":
-            return self._send_json(404, {"error": "not found"})
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            _ = self.rfile.read(length)
-        return self._send_json(200, {"result_url": self._result_url()})
+        body = self.rfile.read(length) if length else b""
+        if self.path == "/query":
+            return self._send_json(200, {"result_url": self._result_url()})
+        if self.path == "/ingest":
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                return self._send_json(400, {"error": "invalid json"})
+            items = payload.get("items") or []
+            written = self._write_ingest(items)
+            missing_pdf = sum(1 for item in items if item.get("pdf_missing"))
+            return self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "received": len(items),
+                    "written": written,
+                    "missing_pdf": missing_pdf,
+                },
+            )
+        return self._send_json(404, {"error": "not found"})
 
 
 def main():

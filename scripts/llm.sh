@@ -14,7 +14,7 @@ model_name=Qwen/Qwen3-Next-80B-A3B-Instruct
 # )
 base_output_dir=./store/llm
 mkdir -p ${base_output_dir}
-python llm_enrich.py \
+uv run python llm_enrich.py \
   --model "$model_name" \
   --base_output_dir "$base_output_dir" \
   --base_url "https://api.siliconflow.cn/v1" \

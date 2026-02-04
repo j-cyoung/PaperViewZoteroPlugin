@@ -8,7 +8,8 @@
 ## Demo 行为
 - 在 Zotero 文献列表右键菜单增加 `Query`
 - 点击后在 Zotero 调试输出中打印选中条目的 item key
-- 同时调用本地服务 `/query`，并打开返回的 `result_url`
+- 向本地服务 `/ingest` 发送元信息与 PDF 路径（仅存储型附件）
+- 调用 `/query` 并打开返回的 `result_url`
 
 ## 编译与安装（打包成 .xpi）
 1. 在仓库根目录执行以下命令生成安装包：
@@ -28,6 +29,20 @@ python local_service.py --port 23119
 ```
 
 服务启动后，右键点击 `Query` 会打开本地演示页面。
+
+### 数据落盘位置
+`/ingest` 接收到的数据会覆盖写入：`store/zotero/items.jsonl`
+
+## OCR 流程（Zotero 数据）
+将 `items.jsonl` 转为 OCR 输入 CSV，并生成兼容的 `papers.pages.jsonl`：
+
+```bash
+./scripts/ocr_from_zotero.sh
+```
+
+输出位置：
+- `store/zotero/items.csv`
+- `store/zotero/ocr/papers.pages.jsonl`
 
 ## 开发模式（可选）
 如果你希望直接从源码加载（不用每次打包）：
