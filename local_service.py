@@ -85,7 +85,7 @@ class DemoHandler(BaseHTTPRequestHandler):
         print(f"[cmd] {cmd_display}")
         subprocess.run(cmd, cwd=cwd, check=True)
 
-    def _ensure_ocr_cache(self):
+    def _ensure_ocr_cache(self, progress_path=None, status_cb=None):
         base_dir = self._base_dir()
         self._ocr_dir().mkdir(parents=True, exist_ok=True)
         # update items.csv from items.jsonl
@@ -103,24 +103,66 @@ class DemoHandler(BaseHTTPRequestHandler):
             cwd=base_dir,
         )
         # run OCR with resume to reuse cached results
-        self._run_cmd(
-            [
-                "uv",
-                "run",
-                "python",
-                "pdf_to_md_pymupdf4llm.py",
-                "--csv_in",
-                str(self._items_csv()),
-                "--base_output_dir",
-                str(self._ocr_dir()),
-                "--out_jsonl",
-                "papers.pages.jsonl",
-                "--resume",
-                "--resume_from",
-                str(self._pages_jsonl()),
-            ],
-            cwd=base_dir,
-        )
+        cmd = [
+            "uv",
+            "run",
+            "python",
+            "pdf_to_md_pymupdf4llm.py",
+            "--csv_in",
+            str(self._items_csv()),
+            "--base_output_dir",
+            str(self._ocr_dir()),
+            "--out_jsonl",
+            "papers.pages.jsonl",
+            "--resume",
+            "--resume_from",
+            str(self._pages_jsonl()),
+        ]
+        if progress_path:
+            cmd += ["--progress_path", str(progress_path)]
+        if not status_cb:
+            self._run_cmd(cmd, cwd=base_dir)
+            return
+        proc = subprocess.Popen(cmd, cwd=base_dir)
+        out_jsonl = self._pages_jsonl()
+        last_done = -1
+        last_total = -1
+        while proc.poll() is None:
+            done = None
+            total = None
+            if progress_path:
+                try:
+                    progress = json.loads(Path(progress_path).read_text(encoding="utf-8"))
+                    done = int(progress.get("done") or 0)
+                    total = int(progress.get("total") or 0)
+                except Exception:
+                    done = None
+                    total = None
+            if done is None and out_jsonl.exists():
+                with out_jsonl.open("r", encoding="utf-8") as f:
+                    done = sum(1 for line in f if line.strip())
+            if done is not None:
+                if done != last_done or total != last_total:
+                    status_cb(done, total)
+                    last_done = done
+                    last_total = total
+            time.sleep(1)
+        if proc.returncode != 0:
+            raise RuntimeError(f"pdf_to_md_pymupdf4llm failed with code {proc.returncode}")
+        # final update
+        if progress_path:
+            try:
+                progress = json.loads(Path(progress_path).read_text(encoding="utf-8"))
+                done = int(progress.get("done") or 0)
+                total = int(progress.get("total") or 0)
+                status_cb(done, total)
+                return
+            except Exception:
+                pass
+        if out_jsonl.exists():
+            with out_jsonl.open("r", encoding="utf-8") as f:
+                done = sum(1 for line in f if line.strip())
+            status_cb(done, None)
 
     def _load_jsonl(self, path):
         rows = []
@@ -152,6 +194,32 @@ class DemoHandler(BaseHTTPRequestHandler):
                 selected.append(row)
         self._write_jsonl(out_path, selected)
         return len(selected)
+
+    def _count_selected_ocr_done(self, selected_keys):
+        pages_path = self._pages_jsonl()
+        if not pages_path.exists() or not selected_keys:
+            return 0
+        done_keys = set()
+        try:
+            with pages_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    pid = (
+                        row.get("paper_id")
+                        or row.get("zotero_item_key")
+                        or row.get("item_key")
+                    )
+                    if pid in selected_keys:
+                        done_keys.add(pid)
+        except Exception:
+            return 0
+        return len(done_keys)
 
     def _query_job_dir(self, job_id):
         job_dir = self._query_dir() / job_id
@@ -275,9 +343,17 @@ class DemoHandler(BaseHTTPRequestHandler):
         self._write_query_snapshot(job_dir, payload, selected)
 
         # ensure OCR cache (incremental)
-        self._write_status(job_dir, "ocr", 0, len(selected))
-        self._ensure_ocr_cache()
-        self._write_status(job_dir, "ocr", len(selected), len(selected))
+        ocr_total = len(selected)
+        self._write_status(job_dir, "ocr", 0, ocr_total)
+        progress_path = job_dir / "ocr.progress.json"
+        selected_keys = {item.get("item_key") for item in selected if item.get("item_key")}
+
+        def ocr_update(_done, _total):
+            done_selected = self._count_selected_ocr_done(selected_keys)
+            self._write_status(job_dir, "ocr", done_selected, ocr_total)
+
+        self._ensure_ocr_cache(progress_path=progress_path, status_cb=ocr_update)
+        self._write_status(job_dir, "ocr", ocr_total, ocr_total)
 
         # filter OCR pages for selected items
         filtered_pages = job_dir / "pages.selected.jsonl"
@@ -336,6 +412,34 @@ class DemoHandler(BaseHTTPRequestHandler):
             with out_jsonl.open("r", encoding="utf-8") as f:
                 done = sum(1 for line in f if line.strip())
         self._write_status(job_dir, "done", done, total)
+        return job_id
+
+    def _run_ocr_pipeline(self, payload, job_id):
+        item_keys = payload.get("item_keys") or []
+        if not item_keys:
+            raise ValueError("missing item_keys")
+        job_dir = self._query_job_dir(job_id)
+        self._write_status(job_dir, "queued", 0, len(item_keys) or 0)
+
+        items_path = self._items_jsonl()
+        if not items_path.exists():
+            raise ValueError("items.jsonl not found; run ingest first")
+        items = self._load_jsonl(items_path)
+        selected = [item for item in items if item.get("item_key") in set(item_keys)]
+        if not selected:
+            raise ValueError("no matching items in items.jsonl")
+
+        ocr_total = len(selected)
+        self._write_status(job_dir, "ocr", 0, ocr_total)
+        progress_path = job_dir / "ocr.progress.json"
+        selected_keys = {item.get("item_key") for item in selected if item.get("item_key")}
+
+        def ocr_update(_done, _total):
+            done_selected = self._count_selected_ocr_done(selected_keys)
+            self._write_status(job_dir, "ocr", done_selected, ocr_total)
+
+        self._ensure_ocr_cache(progress_path=progress_path, status_cb=ocr_update)
+        self._write_status(job_dir, "done", ocr_total, ocr_total)
         return job_id
 
     def _serve_query_result(self, job_id):
@@ -413,6 +517,24 @@ class DemoHandler(BaseHTTPRequestHandler):
 
             threading.Thread(target=run_job, daemon=True).start()
             return self._send_json(200, {"result_url": result_url, "job_id": job_id})
+        if self.path == "/ocr":
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            item_keys = payload.get("item_keys") or []
+            job_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
+            job_dir = self._query_job_dir(job_id)
+            self._write_status(job_dir, "queued", 0, len(item_keys) or 0)
+
+            def run_job():
+                try:
+                    self._run_ocr_pipeline(payload, job_id)
+                except Exception as e:
+                    self._write_status(job_dir, "error", 0, len(item_keys) or 0, str(e))
+
+            threading.Thread(target=run_job, daemon=True).start()
+            return self._send_json(200, {"job_id": job_id})
         if self.path == "/ingest":
             try:
                 payload = json.loads(body.decode("utf-8") or "{}")

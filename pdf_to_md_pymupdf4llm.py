@@ -4,6 +4,7 @@
 import os
 import json
 import argparse
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Union
 
 import pymupdf4llm
@@ -131,6 +132,7 @@ def main():
                     help="Disable tqdm progress bar")
     ap.add_argument("--resume", action="store_true", default=False)
     ap.add_argument("--resume_from", default="", help="Optional path to prior pages jsonl")
+    ap.add_argument("--progress_path", default="", help="Optional progress json path")
 
     args = ap.parse_args()
 
@@ -150,10 +152,38 @@ def main():
         args.out_jsonl = apply_base_dir(args.out_jsonl, args.base_output_dir)
         args.issues_out = apply_base_dir(args.issues_out, args.base_output_dir)
         args.image_dir = apply_base_dir(args.image_dir, args.base_output_dir)
+        if args.progress_path:
+            args.progress_path = apply_base_dir(args.progress_path, args.base_output_dir)
+
+    def write_progress(done: int, total: int) -> None:
+        if not args.progress_path:
+            return
+        payload = {
+            "done": done,
+            "total": total,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp_path = args.progress_path + ".tmp"
+        try:
+            parent = os.path.dirname(args.progress_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp_path, args.progress_path)
+        except Exception:
+            pass
 
     rows = load_csv(args.csv_in)
     if args.top_k and args.top_k > 0:
         rows = rows[:args.top_k]
+    total = len(rows)
+    done_count = 0
+
+    def mark_progress() -> None:
+        nonlocal done_count
+        done_count += 1
+        write_progress(done_count, total)
 
     safe_mkdir(args.md_dir)
     if args.write_images:
@@ -179,6 +209,7 @@ def main():
     n_missing = 0
     n_error = 0
     issues: List[Dict[str, Any]] = []
+    write_progress(done_count, total)
 
     for idx, row in enumerate(iterator, start=1):
         row = ensure_ids(dict(row))
@@ -199,6 +230,7 @@ def main():
                     n_ok += 1
                     if args.verbose:
                         print(f"[{idx}] resume_ok | arxiv_id={arxiv_id} | md={md_path} | title={title[:80]}")
+                    mark_progress()
                     continue
 
         pdf_path, find_reason = find_pdf_for_row(row, args.pdf_dir, by_arxiv, by_token)
@@ -225,6 +257,7 @@ def main():
             })
             if args.verbose:
                 print(f"[{idx}] missing_pdf | arxiv_id={arxiv_id} | title={title[:80]}")
+            mark_progress()
             continue
 
         # 默认先设为失败，后续逐步置 True（避免“写 md 成功但 json 失败”的错觉）
@@ -321,6 +354,7 @@ def main():
 
             if args.verbose:
                 print(f"[{idx}] {obj['md_status']} | arxiv_id={arxiv_id} | title={title[:80]} | err={md_error}")
+        mark_progress()
 
     out_f.close()
     if issues:
@@ -336,6 +370,7 @@ def main():
     print(f"Done. ok={n_ok}, error={n_error}, missing_pdf={n_missing}, out={args.out_jsonl}, md_dir={args.md_dir}")
     if issues:
         print(f"Issues: {len(issues)} -> {args.issues_out}")
+    write_progress(total, total)
 
 
 if __name__ == "__main__":

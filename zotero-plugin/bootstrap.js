@@ -174,6 +174,19 @@ async function queryService(itemKeys, queryText, sectionsText, queryMode) {
   return data;
 }
 
+async function ocrService(itemKeys) {
+  const baseUrl = getServiceBaseUrl();
+  const payload = {
+    item_keys: itemKeys
+  };
+  const resp = await Zotero.HTTP.request("POST", `${baseUrl}/ocr`, {
+    body: JSON.stringify(payload),
+    headers: { "Content-Type": "application/json" }
+  });
+  const text = resp.responseText || resp.response || "";
+  return JSON.parse(text);
+}
+
 async function showQueryProgress(jobId, resultUrl) {
   const baseUrl = getServiceBaseUrl();
   const win = Zotero.getMainWindow();
@@ -212,6 +225,59 @@ async function showQueryProgress(jobId, resultUrl) {
         win.clearInterval(timer);
         pw.close();
         Zotero.launchURL(resultUrl);
+      }
+      if (stage === "error") {
+        progress.setProgress(100);
+        progress.setText(`失败${msg}`);
+        stopped = true;
+        win.clearInterval(timer);
+      }
+    } catch (err) {
+      progress.setText("等待服务响应...");
+    }
+  };
+
+  const timer = win.setInterval(update, 1000);
+  update();
+}
+
+async function showOcrProgress(jobId) {
+  const baseUrl = getServiceBaseUrl();
+  const win = Zotero.getMainWindow();
+  const pw = new Zotero.ProgressWindow({ closeOnClick: false });
+  pw.changeHeadline("PaperView OCR 中");
+  const icon = `chrome://zotero/skin/treesource-unfiled${Zotero.hiDPI ? "@2x" : ""}.png`;
+  const progress = new pw.ItemProgress(icon, "准备中...");
+  progress.setProgress(0);
+  pw.show();
+
+  let stopped = false;
+  const update = async () => {
+    if (stopped) return;
+    try {
+      const resp = await Zotero.HTTP.request("GET", `${baseUrl}/status/${jobId}`, {
+        headers: { "Content-Type": "application/json" }
+      });
+      const text = resp.responseText || resp.response || "";
+      const data = JSON.parse(text);
+      const stage = data.stage || "ocr";
+      const done = Number(data.done || 0);
+      const total = Number(data.total || 0);
+      const msg = data.message ? ` ${data.message}` : "";
+      let percent = 0;
+      if (total > 0) {
+        percent = Math.min(100, Math.round((done * 100) / total));
+      } else if (stage === "done") {
+        percent = 100;
+      }
+      progress.setProgress(percent);
+      progress.setText(`${stage} ${total > 0 ? `${done}/${total}` : ""}${msg}`.trim());
+      if (stage === "done") {
+        progress.setProgress(100);
+        progress.setText("完成");
+        stopped = true;
+        win.clearInterval(timer);
+        pw.close();
       }
       if (stage === "error") {
         progress.setProgress(100);
@@ -329,6 +395,49 @@ function attachMenuToWindow(win) {
       cleanupHandlers.push(() => {
         concatItem.removeEventListener("command", onConcatCommand);
         if (concatItem.parentNode) concatItem.parentNode.removeChild(concatItem);
+      });
+    }
+
+    let ocrItem = doc.getElementById("paperview-ocr-menuitem");
+    if (!ocrItem) {
+      ocrItem = doc.createXULElement
+        ? doc.createXULElement("menuitem")
+        : doc.createElement("menuitem");
+      ocrItem.setAttribute("id", "paperview-ocr-menuitem");
+      ocrItem.setAttribute("label", "OCR Cache");
+
+      const onOcrCommand = async () => {
+        try {
+          const items = Zotero.getActiveZoteroPane().getSelectedItems();
+          const keys = items.map((item) => item.key);
+          Zotero.debug(
+            `[PaperView] OCR selected ${keys.length} item(s): ${keys.join(", ")}`
+          );
+          if (!items || items.length === 0) return;
+          const ingest = await ingestItems(items);
+          Zotero.debug(`[PaperView] Ingested: ${JSON.stringify(ingest)}`);
+          const result = await ocrService(keys);
+          if (result && result.job_id) {
+            await showOcrProgress(result.job_id);
+          }
+        } catch (err) {
+          Zotero.debug(`[PaperView] OCR command error: ${err}`);
+        }
+      };
+
+      const onOcrPopupShowing = () => {
+        const items = Zotero.getActiveZoteroPane().getSelectedItems();
+        ocrItem.hidden = !items || items.length === 0;
+      };
+
+      ocrItem.addEventListener("command", onOcrCommand);
+      menu.addEventListener("popupshowing", onOcrPopupShowing);
+      menu.appendChild(ocrItem);
+
+      cleanupHandlers.push(() => {
+        menu.removeEventListener("popupshowing", onOcrPopupShowing);
+        ocrItem.removeEventListener("command", onOcrCommand);
+        if (ocrItem.parentNode) ocrItem.parentNode.removeChild(ocrItem);
       });
     }
 

@@ -622,7 +622,7 @@ def main() -> None:
                     help="按标题关键字筛选论文（大小写不敏感，如：data）")
     ap.add_argument("--top_k", type=int, default=0,
                     help="只处理前K篇论文（0=全部）")
-    ap.add_argument("--concurrency", type=int, default=1,
+    ap.add_argument("--concurrency", type=int, default=5,
                     help="并发请求数量")
     ap.add_argument("--retry_on_429", action="store_true", default=False,
                     help="遇到429时持续重试")
