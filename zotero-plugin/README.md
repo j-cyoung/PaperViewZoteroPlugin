@@ -15,9 +15,25 @@
 ```
 2. 在 Zotero 插件管理器中拖入 `paperview-query.xpi` 安装
 
-**启动后端服务**
+**服务启动/停止（插件内）**
+- Zotero 顶部菜单：`Tools` → `PaperView: Start Service` / `PaperView: Stop Service`
+- 插件加载时会自动准备 Python 环境（首次可能较慢）
+- Zotero 退出时会自动停止服务
+**API Key 设置**
+- Zotero 顶部菜单：`Tools` → `PaperView: Set API Key`
+- 插件会将 API Key 传入服务进程（等价于设置 `OPENAI_API_KEY`/`SILICONFLOW_API_KEY`）
+**LLM 配置（文件 + 菜单）**
+- 菜单：`Tools` → `PaperView: LLM Settings`
+- 配置文件：`<ZoteroProfile>/paperview/llm_config.json`（默认基于当前配置自动生成）
+
+**日志位置（便于调试）**
+- 服务输出：`<ZoteroProfile>/paperview/logs/service.log`
+- 环境安装：`<ZoteroProfile>/paperview/logs/env-install.log`
+- pip 详细日志：`<ZoteroProfile>/paperview/logs/pip-install.log`
+
+**手动启动后端服务（可选）**
 ```bash
-uv run python local_service.py --port 20341
+python local_service.py --port 20341
 ```
 
 **设置端口/服务地址**
@@ -45,9 +61,25 @@ Zotero 顶部菜单：`Tools` → `PaperView: Set Service URL`
 ```
 2. Drag `paperview-query.xpi` into Zotero Add-ons manager
 
-**Start Backend Service**
+**Start/Stop Service (in Zotero)**
+- Zotero menu: `Tools` → `PaperView: Start Service` / `PaperView: Stop Service`
+- Env bootstrap runs automatically after install (first run may take time)
+- Service stops automatically when Zotero quits
+**API Key**
+- Zotero menu: `Tools` → `PaperView: Set API Key`
+- The key is injected into the service process as `OPENAI_API_KEY` / `SILICONFLOW_API_KEY`
+**LLM Config (file + menu)**
+- Menu: `Tools` → `PaperView: LLM Settings`
+- Config file: `<ZoteroProfile>/paperview/llm_config.json` (auto-generated from current settings)
+
+**Logs (for debugging)**
+- Service: `<ZoteroProfile>/paperview/logs/service.log`
+- Env setup: `<ZoteroProfile>/paperview/logs/env-install.log`
+- pip details: `<ZoteroProfile>/paperview/logs/pip-install.log`
+
+**Manual Start (optional)**
 ```bash
-uv run python local_service.py --port 20341
+python local_service.py --port 20341
 ```
 
 **Configure Service URL**
