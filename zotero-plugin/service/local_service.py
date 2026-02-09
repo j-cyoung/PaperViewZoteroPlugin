@@ -15,6 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+DEFAULT_OCR_CONCURRENCY = 4
+OCR_CACHE_LOCK = threading.Lock()
+
 
 class DemoHandler(BaseHTTPRequestHandler):
     server_version = "PaperViewDemo/0.1"
@@ -71,16 +74,30 @@ class DemoHandler(BaseHTTPRequestHandler):
         store_dir.mkdir(parents=True, exist_ok=True)
         out_file = self._items_jsonl()
         now = datetime.now(timezone.utc).isoformat()
-        lines = []
+        existing_by_key = {}
+        for row in self._load_jsonl(out_file):
+            if not isinstance(row, dict):
+                continue
+            key = row.get("item_key") or row.get("paper_id")
+            if not key:
+                continue
+            existing_by_key[key] = row
+
+        incoming = 0
         for item in items:
             if not isinstance(item, dict):
                 continue
             item.setdefault("ingest_time", now)
-            lines.append(json.dumps(item, ensure_ascii=False))
-        if lines:
+            key = item.get("item_key") or item.get("paper_id")
+            if not key:
+                continue
+            incoming += 1
+            existing_by_key[key] = item
+        if existing_by_key:
+            lines = [json.dumps(v, ensure_ascii=False) for v in existing_by_key.values()]
             with out_file.open("w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
-        return len(lines)
+        return incoming
 
     def _run_cmd(self, cmd, cwd=None):
         cmd_display = " ".join(cmd)
@@ -89,80 +106,160 @@ class DemoHandler(BaseHTTPRequestHandler):
         env.setdefault("PYTHONUNBUFFERED", "1")
         subprocess.run(cmd, cwd=cwd, check=True, env=env)
 
-    def _ensure_ocr_cache(self, progress_path=None, status_cb=None):
-        base_dir = self._base_dir()
-        self._ocr_dir().mkdir(parents=True, exist_ok=True)
-        # update items.csv from items.jsonl
-        self._run_cmd(
-            [
-                sys.executable,
-                "zotero_items_to_csv.py",
-                "--jsonl",
-                str(self._items_jsonl()),
-                "--csv_out",
-                str(self._items_csv()),
-            ],
-            cwd=base_dir,
+    def _pick_positive_int(self, *values, default=1):
+        for val in values:
+            if val is None:
+                continue
+            try:
+                n = int(float(val))
+            except Exception:
+                continue
+            if n > 0:
+                return n
+        return default
+
+    def _load_runtime_config(self):
+        config_path = LLM_CONFIG_PATH or os.environ.get("PAPERVIEW_LLM_CONFIG", "")
+        if not config_path:
+            return {}
+        try:
+            return json.loads(Path(config_path).read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _resolve_ocr_concurrency(self, payload=None):
+        cfg = self._load_runtime_config()
+        req = payload if isinstance(payload, dict) else {}
+        return self._pick_positive_int(
+            req.get("ocr_concurrency"),
+            cfg.get("ocr_concurrency"),
+            cfg.get("concurrency"),
+            os.environ.get("PAPERVIEW_OCR_CONCURRENCY"),
+            default=DEFAULT_OCR_CONCURRENCY,
         )
-        # run OCR with resume to reuse cached results
-        cmd = [
-            sys.executable,
-            "pdf_to_md_pymupdf4llm.py",
-            "--csv_in",
-            str(self._items_csv()),
-            "--base_output_dir",
-            str(self._ocr_dir()),
-            "--out_jsonl",
-            "papers.pages.jsonl",
-            "--resume",
-            "--resume_from",
-            str(self._pages_jsonl()),
-        ]
-        if progress_path:
-            cmd += ["--progress_path", str(progress_path)]
-        if not status_cb:
-            self._run_cmd(cmd, cwd=base_dir)
-            return
-        proc = subprocess.Popen(cmd, cwd=base_dir)
-        out_jsonl = self._pages_jsonl()
-        last_done = -1
-        last_total = -1
-        while proc.poll() is None:
-            done = None
-            total = None
+
+    def _row_item_key(self, row):
+        return (
+            row.get("paper_id")
+            or row.get("zotero_item_key")
+            or row.get("item_key")
+        )
+
+    def _selected_ocr_stats(self, selected_keys):
+        pages_path = self._pages_jsonl()
+        if not pages_path.exists() or not selected_keys:
+            return {"processed": 0, "ok": 0, "error": 0}
+        processed = set()
+        ok = set()
+        error = set()
+        try:
+            with pages_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    pid = self._row_item_key(row)
+                    if pid not in selected_keys:
+                        continue
+                    processed.add(pid)
+                    md_status = str(row.get("md_status") or "").lower()
+                    has_text = bool(row.get("md_pages")) or bool(str(row.get("md_text") or "").strip())
+                    if md_status == "ok" and has_text:
+                        ok.add(pid)
+                    elif md_status in {"error", "missing_pdf"} or not has_text:
+                        error.add(pid)
+        except Exception:
+            return {"processed": 0, "ok": 0, "error": 0}
+        return {"processed": len(processed), "ok": len(ok), "error": len(error)}
+
+    def _ensure_ocr_cache(self, progress_path=None, status_cb=None, ocr_concurrency=DEFAULT_OCR_CONCURRENCY):
+        with OCR_CACHE_LOCK:
+            base_dir = self._base_dir()
+            self._ocr_dir().mkdir(parents=True, exist_ok=True)
+            # update items.csv from items.jsonl
+            self._run_cmd(
+                [
+                    sys.executable,
+                    "zotero_items_to_csv.py",
+                    "--jsonl",
+                    str(self._items_jsonl()),
+                    "--csv_out",
+                    str(self._items_csv()),
+                ],
+                cwd=base_dir,
+            )
+            # run OCR with resume to reuse cached results
+            cmd = [
+                sys.executable,
+                "pdf_to_md_pymupdf4llm.py",
+                "--csv_in",
+                str(self._items_csv()),
+                "--base_output_dir",
+                str(self._ocr_dir()),
+                "--out_jsonl",
+                "papers.pages.jsonl",
+                "--resume",
+                "--resume_from",
+                str(self._pages_jsonl()),
+                "--concurrency",
+                str(max(1, int(ocr_concurrency))),
+            ]
+            if progress_path:
+                cmd += ["--progress_path", str(progress_path)]
+            print(f"[ocr] start ensure cache, concurrency={ocr_concurrency}, progress_path={progress_path}")
+            print(f"[cmd] {' '.join(cmd)}")
+            if not status_cb:
+                self._run_cmd(cmd, cwd=base_dir)
+                return
+            proc = subprocess.Popen(cmd, cwd=base_dir)
+            out_jsonl = self._pages_jsonl()
+            last_done = -1
+            last_total = -1
+            last_tick = 0.0
+            while proc.poll() is None:
+                done = None
+                total = None
+                if progress_path:
+                    try:
+                        progress = json.loads(Path(progress_path).read_text(encoding="utf-8"))
+                        done = int(progress.get("done") or 0)
+                        total = int(progress.get("total") or 0)
+                    except Exception:
+                        done = None
+                        total = None
+                if done is None and out_jsonl.exists():
+                    with out_jsonl.open("r", encoding="utf-8") as f:
+                        done = sum(1 for line in f if line.strip())
+                if done is not None:
+                    if done != last_done or total != last_total:
+                        status_cb(done, total)
+                        now = time.time()
+                        if now - last_tick >= 10:
+                            print(f"[ocr] progress done={done}, total={total}")
+                            last_tick = now
+                        last_done = done
+                        last_total = total
+                time.sleep(1)
+            if proc.returncode != 0:
+                raise RuntimeError(f"pdf_to_md_pymupdf4llm failed with code {proc.returncode}")
+            # final update
             if progress_path:
                 try:
                     progress = json.loads(Path(progress_path).read_text(encoding="utf-8"))
                     done = int(progress.get("done") or 0)
                     total = int(progress.get("total") or 0)
+                    status_cb(done, total)
+                    return
                 except Exception:
-                    done = None
-                    total = None
-            if done is None and out_jsonl.exists():
+                    pass
+            if out_jsonl.exists():
                 with out_jsonl.open("r", encoding="utf-8") as f:
                     done = sum(1 for line in f if line.strip())
-            if done is not None:
-                if done != last_done or total != last_total:
-                    status_cb(done, total)
-                    last_done = done
-                    last_total = total
-            time.sleep(1)
-        if proc.returncode != 0:
-            raise RuntimeError(f"pdf_to_md_pymupdf4llm failed with code {proc.returncode}")
-        # final update
-        if progress_path:
-            try:
-                progress = json.loads(Path(progress_path).read_text(encoding="utf-8"))
-                done = int(progress.get("done") or 0)
-                total = int(progress.get("total") or 0)
-                status_cb(done, total)
-                return
-            except Exception:
-                pass
-        if out_jsonl.exists():
-            with out_jsonl.open("r", encoding="utf-8") as f:
-                done = sum(1 for line in f if line.strip())
-            status_cb(done, None)
+                status_cb(done, None)
 
     def _load_jsonl(self, path):
         rows = []
@@ -189,37 +286,14 @@ class DemoHandler(BaseHTTPRequestHandler):
         key_set = set(item_keys)
         selected = []
         for row in pages:
-            paper_id = row.get("paper_id") or row.get("zotero_item_key")
+            paper_id = self._row_item_key(row)
             if paper_id in key_set:
                 selected.append(row)
         self._write_jsonl(out_path, selected)
         return len(selected)
 
     def _count_selected_ocr_done(self, selected_keys):
-        pages_path = self._pages_jsonl()
-        if not pages_path.exists() or not selected_keys:
-            return 0
-        done_keys = set()
-        try:
-            with pages_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except Exception:
-                        continue
-                    pid = (
-                        row.get("paper_id")
-                        or row.get("zotero_item_key")
-                        or row.get("item_key")
-                    )
-                    if pid in selected_keys:
-                        done_keys.add(pid)
-        except Exception:
-            return 0
-        return len(done_keys)
+        return self._selected_ocr_stats(selected_keys).get("processed", 0)
 
     def _query_job_dir(self, job_id):
         job_dir = self._query_dir() / job_id
@@ -347,13 +421,29 @@ class DemoHandler(BaseHTTPRequestHandler):
         self._write_status(job_dir, "ocr", 0, ocr_total)
         progress_path = job_dir / "ocr.progress.json"
         selected_keys = {item.get("item_key") for item in selected if item.get("item_key")}
+        ocr_concurrency = self._resolve_ocr_concurrency(payload)
+        print(
+            f"[ocr-job] query pipeline job={job_id} selected={len(selected)} "
+            f"ocr_concurrency={ocr_concurrency}"
+        )
 
         def ocr_update(_done, _total):
-            done_selected = self._count_selected_ocr_done(selected_keys)
-            self._write_status(job_dir, "ocr", done_selected, ocr_total)
+            stats = self._selected_ocr_stats(selected_keys)
+            message = None
+            if stats["error"] > 0:
+                message = f"ocr error={stats['error']}, ok={stats['ok']}"
+            self._write_status(job_dir, "ocr", stats["processed"], ocr_total, message)
 
-        self._ensure_ocr_cache(progress_path=progress_path, status_cb=ocr_update)
-        self._write_status(job_dir, "ocr", ocr_total, ocr_total)
+        self._ensure_ocr_cache(
+            progress_path=progress_path,
+            status_cb=ocr_update,
+            ocr_concurrency=ocr_concurrency,
+        )
+        final_stats = self._selected_ocr_stats(selected_keys)
+        final_msg = None
+        if final_stats["error"] > 0:
+            final_msg = f"ocr error={final_stats['error']}, ok={final_stats['ok']}"
+        self._write_status(job_dir, "ocr", final_stats["processed"], ocr_total, final_msg)
 
         # filter OCR pages for selected items
         filtered_pages = job_dir / "pages.selected.jsonl"
@@ -435,13 +525,29 @@ class DemoHandler(BaseHTTPRequestHandler):
         self._write_status(job_dir, "ocr", 0, ocr_total)
         progress_path = job_dir / "ocr.progress.json"
         selected_keys = {item.get("item_key") for item in selected if item.get("item_key")}
+        ocr_concurrency = self._resolve_ocr_concurrency(payload)
+        print(
+            f"[ocr-job] ocr pipeline job={job_id} selected={len(selected)} "
+            f"ocr_concurrency={ocr_concurrency}"
+        )
 
         def ocr_update(_done, _total):
-            done_selected = self._count_selected_ocr_done(selected_keys)
-            self._write_status(job_dir, "ocr", done_selected, ocr_total)
+            stats = self._selected_ocr_stats(selected_keys)
+            message = None
+            if stats["error"] > 0:
+                message = f"ocr error={stats['error']}, ok={stats['ok']}"
+            self._write_status(job_dir, "ocr", stats["processed"], ocr_total, message)
 
-        self._ensure_ocr_cache(progress_path=progress_path, status_cb=ocr_update)
-        self._write_status(job_dir, "done", ocr_total, ocr_total)
+        self._ensure_ocr_cache(
+            progress_path=progress_path,
+            status_cb=ocr_update,
+            ocr_concurrency=ocr_concurrency,
+        )
+        final_stats = self._selected_ocr_stats(selected_keys)
+        final_msg = None
+        if final_stats["error"] > 0:
+            final_msg = f"ocr error={final_stats['error']}, ok={final_stats['ok']}"
+        self._write_status(job_dir, "done", final_stats["processed"], ocr_total, final_msg)
         return job_id
 
     def _serve_query_result(self, job_id):

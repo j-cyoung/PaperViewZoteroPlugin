@@ -47,6 +47,7 @@ const DEFAULT_LLM_CONFIG = {
   temperature: 0.0,
   max_output_tokens: 2048,
   concurrency: 5,
+  ocr_concurrency: 4,
   retry_on_429: false,
   retry_wait_s: 300
 };
@@ -156,6 +157,11 @@ function setLlmConfigPref(config) {
 }
 
 function normalizeLlmConfig(raw) {
+  const normalizePositiveInt = (value, fallback) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(1, Math.floor(n));
+  };
   const cfg = Object.assign({}, DEFAULT_LLM_CONFIG, raw || {});
   cfg.base_url = String(cfg.base_url || DEFAULT_LLM_CONFIG.base_url);
   cfg.model = String(cfg.model || DEFAULT_LLM_CONFIG.model);
@@ -166,9 +172,14 @@ function normalizeLlmConfig(raw) {
   cfg.max_output_tokens = Number.isFinite(Number(cfg.max_output_tokens))
     ? Number(cfg.max_output_tokens)
     : DEFAULT_LLM_CONFIG.max_output_tokens;
-  cfg.concurrency = Number.isFinite(Number(cfg.concurrency))
-    ? Number(cfg.concurrency)
-    : DEFAULT_LLM_CONFIG.concurrency;
+  cfg.concurrency = normalizePositiveInt(
+    cfg.concurrency,
+    DEFAULT_LLM_CONFIG.concurrency
+  );
+  cfg.ocr_concurrency = normalizePositiveInt(
+    cfg.ocr_concurrency,
+    DEFAULT_LLM_CONFIG.ocr_concurrency
+  );
   cfg.retry_on_429 = typeof cfg.retry_on_429 === "boolean"
     ? cfg.retry_on_429
     : DEFAULT_LLM_CONFIG.retry_on_429;
@@ -734,8 +745,10 @@ async function queryService(itemKeys, queryText, sectionsText, queryMode) {
 
 async function ocrService(itemKeys) {
   const baseUrl = getServiceBaseUrl();
+  const cfg = getCurrentLlmConfig();
   const payload = {
-    item_keys: itemKeys
+    item_keys: itemKeys,
+    ocr_concurrency: cfg.ocr_concurrency
   };
   const resp = await Zotero.HTTP.request("POST", `${baseUrl}/ocr`, {
     body: JSON.stringify(payload),
@@ -1135,6 +1148,8 @@ function attachToolsMenuToWindow(win) {
           if (maxTokensRaw === null) return;
           const concurrencyRaw = ask("Concurrency", current.concurrency);
           if (concurrencyRaw === null) return;
+          const ocrConcurrencyRaw = ask("OCR Concurrency", current.ocr_concurrency);
+          if (ocrConcurrencyRaw === null) return;
           const retryOn429Raw = ask("Retry On 429 (true/false)", current.retry_on_429);
           if (retryOn429Raw === null) return;
           const retryWaitRaw = ask("Retry Wait Seconds", current.retry_wait_s);
@@ -1146,6 +1161,7 @@ function attachToolsMenuToWindow(win) {
             temperature: Number(temperatureRaw),
             max_output_tokens: Number(maxTokensRaw),
             concurrency: Number(concurrencyRaw),
+            ocr_concurrency: Number(ocrConcurrencyRaw),
             retry_on_429:
               String(retryOn429Raw).toLowerCase() === "true" ||
               String(retryOn429Raw).toLowerCase() === "1",

@@ -432,19 +432,28 @@ def extract_sections_from_paper(
         abstract = paper.get("abstract") or ""
         if abstract:
             result["abstract"] = abstract
-    
-    # 从md_pages中提取其他章节
+
     md_pages = paper.get("md_pages") or []
-    if not md_pages:
-        return result
-    
-    # 合并所有页面的文本
-    full_text = "\n".join([page.get("text", "") for page in md_pages])
+    md_text = (paper.get("md_text") or "").strip()
+    full_text = "\n".join([page.get("text", "") for page in md_pages]).strip()
 
     if wants_full_text(section_names):
-        if full_text.strip():
-            result["full_text"] = full_text.strip()
+        if full_text:
+            result["full_text"] = full_text
+            return result
+        if md_text:
+            result["full_text"] = md_text
+            return result
+        # OCR 不可用时兜底，至少返回摘要避免 no_sections。
+        abstract = (paper.get("abstract") or "").strip()
+        if abstract:
+            result["full_text"] = abstract
         return result
+
+    # 从md_pages/md_text中提取其他章节
+    if not full_text and not md_text:
+        return result
+    full_text = full_text or md_text
     
     for section_name in section_names:
         if section_name == "abstract" and "abstract" in result:

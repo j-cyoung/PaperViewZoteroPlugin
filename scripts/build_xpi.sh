@@ -11,6 +11,10 @@ fi
 
 cd "$plugin_dir"
 # macOS zip includes __MACOSX, so exclude it
-zip -r "$out_file" . -x "__MACOSX/*" -x ".DS_Store"
+zip -rFS "$out_file" . \
+  -x "__MACOSX/*" \
+  -x ".DS_Store" \
+  -x "*/__pycache__/*" \
+  -x "*.pyc"
 
 echo "Built: $out_file"

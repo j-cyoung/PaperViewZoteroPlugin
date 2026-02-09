@@ -44,6 +44,7 @@
 - `concurrency`
 - `retry_on_429`
 - `retry_wait_s`
+- `ocr_concurrency` 默认 `4`，用于控制 OCR(PDF→MD) 并发数
 
 **支持的 API 风格**
 - OpenAI-compatible Chat Completions（`/chat/completions`）
@@ -112,6 +113,7 @@ Zotero 顶部菜单：`Tools` → `PaperView: Set Service URL`
 - `concurrency`
 - `retry_on_429`
 - `retry_wait_s`
+- `ocr_concurrency` default is `4`, used by OCR (PDF→MD) worker concurrency
 
 **Supported API Style**
 - OpenAI-compatible Chat Completions (`/chat/completions`)
