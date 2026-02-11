@@ -1,17 +1,28 @@
 #!/bin/bash
 set -euo pipefail
 
-plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../zotero-plugin" && pwd)"
-out_file="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/paperview-query.xpi"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+out_file="$repo_root/paperview-query.xpi"
+package_items=(
+  "manifest.json"
+  "bootstrap.js"
+  "chrome.manifest"
+  "locale"
+  "skin"
+  "service"
+)
 
-if [[ ! -d "$plugin_dir" ]]; then
-  echo "Plugin directory not found: $plugin_dir" >&2
-  exit 1
-fi
+cd "$repo_root"
 
-cd "$plugin_dir"
-# macOS zip includes __MACOSX, so exclude it
-zip -rFS "$out_file" . \
+for item in "${package_items[@]}"; do
+  if [[ ! -e "$item" ]]; then
+    echo "Missing required package item: $item" >&2
+    exit 1
+  fi
+done
+
+rm -f "$out_file"
+zip -rFS "$out_file" "${package_items[@]}" \
   -x "__MACOSX/*" \
   -x ".DS_Store" \
   -x "*/__pycache__/*" \

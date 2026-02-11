@@ -1,119 +1,91 @@
-# PaperView
+# PaperView Zotero Plugin
 
 Chinese version: [README.zh-CN.md](README.zh-CN.md)
 
-## Overview
+## Demo Behavior
 
-PaperView is a local pipeline for paper retrieval and batch analysis. It integrates a Zotero plugin to trigger queries, runs OCR and LLM querying in a local service, and visualizes results in a web page.
+- Adds `Query` / `Concat Query` / `OCR Cache` / `Query History` to Zotero item context menu
+- Sends metadata + PDF path to `/ingest`
+- Calls `/query` and opens `result_url`
+- Shows progress windows (polls `/status/<job_id>`)
+- Right-click actions auto-start the local service if it is not running
 
-## Key Features
+## Install (build .xpi)
 
-- Zotero context menu `Query` / `Concat Query` / `OCR Cache`
-- Optional section targeting (`abstract`, `introduction`, `methods`)
-- Defaults to full text (`full_text`) when no section is specified
-- Right-click actions auto-start backend service when needed
-- Multi-line query input support
-- Progress window during query
-- Result page supports Markdown rendered/raw toggle
-- History page supports switch/delete/clear
-- OCR caching with incremental updates
-- OCR runs in parallel by default with configurable concurrency
-
-## Requirements
-
-- macOS
-- Zotero 8.x
-- Python 3.10+ (used for plugin venv)
-- LLM API Key (`SILICONFLOW_API_KEY` or `OPENAI_API_KEY`)
-
-## Quick Start
-
-1. Build and install the plugin.
+1. From repo root:
 
 ```bash
 ./scripts/build_xpi.sh
 ```
 
-2. Drag `paperview-query.xpi` into Zotero's Add-ons manager and restart.
-3. Set the service URL in Zotero: `Tools` -> `PaperView: Set Service URL`.
-   Example: `http://127.0.0.1:20341`
-4. Set API Key: `Tools` -> `PaperView: Set API Key`
-5. (Optional) Start service manually: `Tools` -> `PaperView: Start Service`
-6. Right-click items and run `Query` / `OCR Cache` (service auto-starts if not running)
+2. Drag `paperview-query.xpi` into Zotero Add-ons manager
 
-## Query Input Format
+## Requirements
 
-- Multi-line input is supported (`Ctrl/Cmd + Enter` to submit)
-- Direct question (defaults to full text):
-  `Summarize the method`
-- With section prefix:
-  `[method] Summarize the method`
-  `[abstract,introduction] Please translate to English`
+- Zotero 8.x
+- Python 3.10+ (available in PATH for venv creation)
 
-## Section Names
+## Start/Stop Service (in Zotero)
 
-- `abstract`
-- `introduction`
-- `related_work` / `background`
-- `methods` / `method` / `approach`
-- `experiments` / `evaluation` / `results`
-- `conclusion` / `discussion`
-- `full_text` / `all`
+- Zotero menu: `Tools` -> `PaperView: Start Service` / `PaperView: Stop Service`
+- Env bootstrap runs automatically after install (first run may take time)
+- Service stops automatically when Zotero quits
+- Query/OCR/History right-click actions will auto-start service when needed
 
-## Data Paths
+## Python Environment Location
 
-- `store/zotero/items.jsonl` ingest snapshot
-- `store/zotero/items.csv` OCR input
-- `store/zotero/ocr/papers.pages.jsonl` OCR output
-- `store/zotero/query/<job_id>/` query outputs
+- venv path: `<ZoteroProfile>/paperview/venv`
 
-## OCR Pipeline
-
-```bash
-./scripts/ocr_from_zotero.sh
-```
-
-Output: `store/zotero/ocr/papers.pages.jsonl`
-
-## Visualization
-
-- Result page: `http://127.0.0.1:20341/result/<job_id>`
-- History page: `http://127.0.0.1:20341/query_view.html`
-- Markdown rendered/raw toggle for responses
-- Delete one history record or clear all history from the history panel
-
-## Configuration
-
-- Service URL: `Tools` -> `PaperView: Set Service URL`
-- Service port: `local_service.py --port <PORT>` (default 20341)
-
-## API Key (recommended via plugin)
+## API Key
 
 - Zotero menu: `Tools` -> `PaperView: Set API Key`
+- The key is injected into the service process as `OPENAI_API_KEY` / `SILICONFLOW_API_KEY`
 
 ## LLM Config (file + menu)
 
-- Zotero menu: `Tools` -> `PaperView: LLM Settings`
-- Config file: `<ZoteroProfile>/paperview/llm_config.json`
-- `ocr_concurrency` controls OCR worker parallelism (default `4`)
+- Menu: `Tools` -> `PaperView: LLM Settings`
+- Config file: `<ZoteroProfile>/paperview/llm_config.json` (auto-generated from current settings)
+
+## LLM Config Fields
+
+- `base_url`
+- `model`
+- `api_key`
+- `temperature`
+- `max_output_tokens`
+- `concurrency`
+- `retry_on_429`
+- `retry_wait_s`
+- `ocr_concurrency` default is `4`, used by OCR (PDF->MD) worker concurrency
 
 ## Supported API Style
 
 - OpenAI-compatible Chat Completions (`/chat/completions`)
 
-## Plugin Logs (Profile directory)
+## Logs (for debugging)
 
-- Service output: `<ZoteroProfile>/paperview/logs/service.log`
+- Service: `<ZoteroProfile>/paperview/logs/service.log`
 - Env setup: `<ZoteroProfile>/paperview/logs/env-install.log`
 - pip details: `<ZoteroProfile>/paperview/logs/pip-install.log`
 
-## Troubleshooting
+## Manual Start (optional)
 
-- Port in use: `lsof -nP -iTCP:20341 -sTCP:LISTEN` then `kill <PID>`
-- Browser not opening: verify service is running and URL matches
-- Progress not updating: ensure `local_service.py` and `query_papers.py` are updated
-- OCR looks slow: check `service.log` for `switch force-serial mode` (parallel failures can trigger serial fallback)
+```bash
+python service/local_service.py --port 20341
+```
 
-## License
+## Configure Service URL
 
-- MIT License (see `LICENSE`)
+Zotero menu: `Tools` -> `PaperView: Set Service URL`  
+Example: `http://127.0.0.1:20341`
+
+## Query Input Format
+
+- Default full text: `Summarize the method`
+- With section prefix: `[method] Summarize the method`
+- Multi-line input is supported (`Ctrl/Cmd + Enter` to submit, `Esc` to cancel)
+
+## Result Page Enhancements
+
+- Response supports Markdown rendered/raw toggle
+- History page supports deleting current record and clearing all history
