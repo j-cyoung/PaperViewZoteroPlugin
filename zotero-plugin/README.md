@@ -1,117 +1,53 @@
-# PaperView Zotero 插件 / PaperView Zotero Plugin
+# PaperView Zotero Plugin
 
-## 中文
+Chinese version: [README.zh-CN.md](README.zh-CN.md)
 
-**Demo 行为**
-- 在 Zotero 文献列表右键菜单增加 `Query` / `Concat Query` / `OCR Cache` / `Query History`
-- 向本地服务 `/ingest` 发送元信息与 PDF 路径（仅存储型附件）
-- 调用 `/query` 并打开返回的 `result_url`
-- 查询过程中显示进度条（轮询 `/status/<job_id>`）
-- 右键操作会自动探活并启动本地服务（若服务未运行）
+## Demo Behavior
 
-**安装（打包成 .xpi）**
-1. 在仓库根目录执行：
-```bash
-./scripts/build_xpi.sh
-```
-2. 在 Zotero 插件管理器中拖入 `paperview-query.xpi` 安装
-
-**环境与依赖**
-- Zotero 8.x
-- Python 3.10+（需在 PATH 中可用，用于创建 venv）
-
-**服务启动/停止（插件内）**
-- Zotero 顶部菜单：`Tools` → `PaperView: Start Service` / `PaperView: Stop Service`
-- 插件加载时会自动准备 Python 环境（首次可能较慢）
-- Zotero 退出时会自动停止服务
-- 右键执行 Query/OCR/History 时，若服务未启动会自动拉起
-
-**Python 环境位置**
-- venv 路径：`<ZoteroProfile>/paperview/venv`
-
-**API Key 设置**
-- Zotero 顶部菜单：`Tools` → `PaperView: Set API Key`
-- 插件会将 API Key 传入服务进程（等价于设置 `OPENAI_API_KEY`/`SILICONFLOW_API_KEY`）
-
-**LLM 配置（文件 + 菜单）**
-- 菜单：`Tools` → `PaperView: LLM Settings`
-- 配置文件：`<ZoteroProfile>/paperview/llm_config.json`（默认基于当前配置自动生成）
-
-**LLM 配置字段**
-- `base_url`
-- `model`
-- `api_key`
-- `temperature`
-- `max_output_tokens`
-- `concurrency`
-- `retry_on_429`
-- `retry_wait_s`
-- `ocr_concurrency` 默认 `4`，用于控制 OCR(PDF→MD) 并发数
-
-**支持的 API 风格**
-- OpenAI-compatible Chat Completions（`/chat/completions`）
-
-**日志位置（便于调试）**
-- 服务输出：`<ZoteroProfile>/paperview/logs/service.log`
-- 环境安装：`<ZoteroProfile>/paperview/logs/env-install.log`
-- pip 详细日志：`<ZoteroProfile>/paperview/logs/pip-install.log`
-
-**手动启动后端服务（可选）**
-```bash
-python local_service.py --port 20341
-```
-
-**设置端口/服务地址**
-Zotero 顶部菜单：`Tools` → `PaperView: Set Service URL`  
-示例：`http://127.0.0.1:20341`
-
-**查询输入格式**
-- 默认全文：`请总结方法`
-- 指定章节：`[method] 总结方法`
-- 支持多行输入（`Ctrl/Cmd + Enter` 提交，`Esc` 取消）
-
-**结果页增强**
-- 回答支持 Markdown 渲染/原文切换
-- 历史查询支持删除当前记录与清空全部记录
-
----
-
-## English
-
-**Demo Behavior**
-- Adds `Query` to Zotero item context menu
+- Adds `Query` / `Concat Query` / `OCR Cache` / `Query History` to Zotero item context menu
 - Sends metadata + PDF path to `/ingest`
 - Calls `/query` and opens `result_url`
-- Shows a progress window (polls `/status/<job_id>`)
+- Shows progress windows (polls `/status/<job_id>`)
+- Right-click actions auto-start the local service if it is not running
 
-**Install (build .xpi)**
+## Install (build .xpi)
+
 1. From repo root:
+
 ```bash
 ./scripts/build_xpi.sh
 ```
+
 2. Drag `paperview-query.xpi` into Zotero Add-ons manager
 
-**Requirements**
+## Requirements
+
 - Zotero 8.x
 - Python 3.10+ (available in PATH for venv creation)
 
-**Start/Stop Service (in Zotero)**
-- Zotero menu: `Tools` → `PaperView: Start Service` / `PaperView: Stop Service`
+## Start/Stop Service (in Zotero)
+
+- Zotero menu: `Tools` -> `PaperView: Start Service` / `PaperView: Stop Service`
 - Env bootstrap runs automatically after install (first run may take time)
 - Service stops automatically when Zotero quits
+- Query/OCR/History right-click actions will auto-start service when needed
 
-**Python Environment Location**
+## Python Environment Location
+
 - venv path: `<ZoteroProfile>/paperview/venv`
 
-**API Key**
-- Zotero menu: `Tools` → `PaperView: Set API Key`
+## API Key
+
+- Zotero menu: `Tools` -> `PaperView: Set API Key`
 - The key is injected into the service process as `OPENAI_API_KEY` / `SILICONFLOW_API_KEY`
 
-**LLM Config (file + menu)**
-- Menu: `Tools` → `PaperView: LLM Settings`
+## LLM Config (file + menu)
+
+- Menu: `Tools` -> `PaperView: LLM Settings`
 - Config file: `<ZoteroProfile>/paperview/llm_config.json` (auto-generated from current settings)
 
-**LLM Config Fields**
+## LLM Config Fields
+
 - `base_url`
 - `model`
 - `api_key`
@@ -120,25 +56,36 @@ Zotero 顶部菜单：`Tools` → `PaperView: Set Service URL`
 - `concurrency`
 - `retry_on_429`
 - `retry_wait_s`
-- `ocr_concurrency` default is `4`, used by OCR (PDF→MD) worker concurrency
+- `ocr_concurrency` default is `4`, used by OCR (PDF->MD) worker concurrency
 
-**Supported API Style**
+## Supported API Style
+
 - OpenAI-compatible Chat Completions (`/chat/completions`)
 
-**Logs (for debugging)**
+## Logs (for debugging)
+
 - Service: `<ZoteroProfile>/paperview/logs/service.log`
 - Env setup: `<ZoteroProfile>/paperview/logs/env-install.log`
 - pip details: `<ZoteroProfile>/paperview/logs/pip-install.log`
 
-**Manual Start (optional)**
+## Manual Start (optional)
+
 ```bash
 python local_service.py --port 20341
 ```
 
-**Configure Service URL**
-Zotero menu: `Tools` → `PaperView: Set Service URL`  
+## Configure Service URL
+
+Zotero menu: `Tools` -> `PaperView: Set Service URL`  
 Example: `http://127.0.0.1:20341`
 
-**Query Input Format**
+## Query Input Format
+
 - Default full text: `Summarize the method`
 - With section prefix: `[method] Summarize the method`
+- Multi-line input is supported (`Ctrl/Cmd + Enter` to submit, `Esc` to cancel)
+
+## Result Page Enhancements
+
+- Response supports Markdown rendered/raw toggle
+- History page supports deleting current record and clearing all history
