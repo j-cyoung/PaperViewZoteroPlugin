@@ -1,0 +1,3 @@
+interface:
+  display_name: "Paperview Release Tag Push"
+  short_description: "Release vX.X.X with commit, tag, and push"
