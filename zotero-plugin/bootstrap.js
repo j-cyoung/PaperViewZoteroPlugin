@@ -11,6 +11,7 @@ var chromeHandle = null;
 var serviceProcess = null;
 var serviceStarting = false;
 var serviceEnvPromise = null;
+var serviceReadyPromise = null;
 const PAPER_VIEW_ICON_FALLBACK_URL =
   "https://raw.githubusercontent.com/simple-icons/simple-icons/develop/icons/zotero.svg";
 var addonRootURI = null;
@@ -601,6 +602,60 @@ function isServiceRunning() {
   return !!(serviceProcess && serviceProcess.isRunning);
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pingServiceHealth() {
+  const baseUrl = getServiceBaseUrl();
+  try {
+    const resp = await Zotero.HTTP.request("GET", `${baseUrl}/health`, {
+      headers: { "Content-Type": "application/json" },
+      timeout: 2000
+    });
+    const text = resp.responseText || resp.response || "";
+    const data = text ? JSON.parse(text) : {};
+    return !!(data && data.ok);
+  } catch (err) {
+    return false;
+  }
+}
+
+async function waitServiceReady(timeoutMs, intervalMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await pingServiceHealth()) {
+      return true;
+    }
+    await delay(intervalMs);
+  }
+  return false;
+}
+
+async function ensureServiceReady() {
+  if (await pingServiceHealth()) {
+    return true;
+  }
+  if (serviceReadyPromise) {
+    return serviceReadyPromise;
+  }
+  serviceReadyPromise = (async () => {
+    Zotero.debug("[PaperView] service not ready, starting background service...");
+    await startService();
+    const ready = await waitServiceReady(90000, 800);
+    if (!ready) {
+      throw new Error(`Service not ready in time. Check log: ${getLogPath()}`);
+    }
+    Zotero.debug("[PaperView] service is ready");
+    return true;
+  })();
+  try {
+    return await serviceReadyPromise;
+  } finally {
+    serviceReadyPromise = null;
+  }
+}
+
 function getStoredPdfAttachment(item) {
   const attachmentIDs = item.getAttachments();
   for (const id of attachmentIDs) {
@@ -1023,6 +1078,7 @@ function attachMenuToWindow(win) {
 
       const onCommand = async () => {
         try {
+          await ensureServiceReady();
           const items = Zotero.getActiveZoteroPane().getSelectedItems();
           const keys = items.map((item) => item.key);
           Zotero.debug(
@@ -1078,6 +1134,7 @@ function attachMenuToWindow(win) {
 
       const onConcatCommand = async () => {
         try {
+          await ensureServiceReady();
           const items = Zotero.getActiveZoteroPane().getSelectedItems();
           const keys = items.map((item) => item.key);
           Zotero.debug(
@@ -1123,6 +1180,7 @@ function attachMenuToWindow(win) {
 
       const onOcrCommand = async () => {
         try {
+          await ensureServiceReady();
           const items = Zotero.getActiveZoteroPane().getSelectedItems();
           const keys = items.map((item) => item.key);
           Zotero.debug(
@@ -1166,12 +1224,14 @@ function attachMenuToWindow(win) {
       applyMenuIcon(historyItem);
 
       const onHistoryCommand = () => {
-        try {
+        ensureServiceReady()
+          .then(() => {
           const baseUrl = getServiceBaseUrl();
           Zotero.launchURL(`${baseUrl}/query_view.html`);
-        } catch (err) {
-          Zotero.debug(`[PaperView] history command error: ${err}`);
-        }
+          })
+          .catch((err) => {
+            Zotero.debug(`[PaperView] history command error: ${err}`);
+          });
       };
 
       historyItem.addEventListener("command", onHistoryCommand);
