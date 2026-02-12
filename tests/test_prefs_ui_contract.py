@@ -26,6 +26,9 @@ class PrefsUIContractTests(unittest.TestCase):
             "paperview-llm-retry-on-429",
             "paperview-pref-save",
             "paperview-pref-reset",
+            "paperview-pref-check-runtime",
+            "paperview-pref-test-connection",
+            "paperview-pref-restart-service",
             "paperview-pref-status",
         ]
 

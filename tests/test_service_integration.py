@@ -26,6 +26,8 @@ class IntegrationTestHandler(local_service.DemoHandler):
         return
 
     def _run_query_pipeline(self, payload, job_id):
+        if payload.get("query") == "boom":
+            raise RuntimeError("query_papers failed with code 2")
         item_keys = payload.get("item_keys") or []
         selected = [{"item_key": k, "title": f"title-{k}"} for k in item_keys]
         job_dir = self._query_job_dir(job_id)
@@ -46,10 +48,44 @@ class IntegrationTestHandler(local_service.DemoHandler):
         return job_id
 
     def _run_ocr_pipeline(self, payload, job_id):
+        if payload.get("force_fail"):
+            raise RuntimeError("pdf_to_md_pymupdf4llm failed with code 1")
         item_keys = payload.get("item_keys") or []
         job_dir = self._query_job_dir(job_id)
         self._write_status(job_dir, "done", len(item_keys), len(item_keys))
         return job_id
+
+    def _runtime_check(self, payload=None):
+        req = payload if isinstance(payload, dict) else {}
+        api_key = str(req.get("api_key") or "").strip()
+        if not api_key:
+            return {
+                "ok": False,
+                "code": "api_key_missing",
+                "error": "missing API key",
+                "runtime": {
+                    "api_key_source": "none",
+                    "env_visible": False,
+                    "platform": "test",
+                },
+            }
+        runtime = {
+            "api_key_source": "request",
+            "env_visible": False,
+            "platform": "test",
+        }
+        if req.get("check_remote"):
+            return {
+                "ok": True,
+                "runtime": runtime,
+                "remote": {
+                    "reachable": True,
+                    "status": 200,
+                    "latency_ms": 12,
+                    "model": req.get("model") or "test-model",
+                },
+            }
+        return {"ok": True, "runtime": runtime}
 
 
 class _DummyServer:
@@ -209,6 +245,43 @@ class ServiceIntegrationTests(unittest.TestCase):
         status, data = self.request_json("GET", "/data/../../etc/passwd")
         self.assertEqual(status, 403)
         self.assertEqual(data.get("error"), "forbidden")
+
+    def test_runtime_check_endpoint(self):
+        status, data = self.request_json(
+            "POST",
+            "/runtime/check",
+            {"api_key": "k1", "base_url": "https://example.com/v1", "model": "m1"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data.get("ok"), True)
+        self.assertEqual(data.get("runtime", {}).get("api_key_source"), "request")
+
+        status, data = self.request_json(
+            "POST",
+            "/runtime/check",
+            {"api_key": "k1", "check_remote": True, "model": "m2"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data.get("ok"), True)
+        self.assertEqual(data.get("remote", {}).get("reachable"), True)
+        self.assertEqual(data.get("remote", {}).get("model"), "m2")
+
+        status, data = self.request_json("POST", "/runtime/check", {"api_key": ""})
+        self.assertEqual(status, 200)
+        self.assertEqual(data.get("ok"), False)
+        self.assertEqual(data.get("code"), "api_key_missing")
+
+    def test_query_status_reports_structured_error_code(self):
+        status, data = self.request_json(
+            "POST",
+            "/query",
+            {"item_keys": ["K1"], "query": "boom"},
+        )
+        self.assertEqual(status, 200)
+        job_id = data.get("job_id")
+        done_status = self.wait_for_job_done(job_id)
+        self.assertEqual(done_status.get("stage"), "error")
+        self.assertEqual(done_status.get("error_code"), "query_pipeline_failed")
 
 
 if __name__ == "__main__":

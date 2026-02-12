@@ -60,6 +60,21 @@ const DEFAULT_LLM_CONFIG = {
   retry_on_429: false,
   retry_wait_s: 300
 };
+const DEFAULT_SERVICE_REQUEST_TIMEOUT_MS = 15000;
+const DEFAULT_STATUS_POLL_TIMEOUT_MS = 4000;
+const DEFAULT_STATUS_POLL_MAX_ERRORS = 8;
+const DEFAULT_RUNTIME_TEST_TIMEOUT_S = 20;
+const PREFS_FIELD_IDS = [
+  "paperview-service-url",
+  "paperview-api-key",
+  "paperview-llm-base-url",
+  "paperview-llm-model",
+  "paperview-llm-temperature",
+  "paperview-llm-max-output-tokens",
+  "paperview-llm-concurrency",
+  "paperview-llm-ocr-concurrency",
+  "paperview-llm-retry-wait"
+];
 function getPaperViewIconURL() {
   if (paperViewIconURL) return paperViewIconURL;
   if (addonRootURI) {
@@ -163,27 +178,307 @@ function showPaperViewAlert(message, title) {
   }
 }
 
+function asErrorText(err) {
+  if (!err) return "";
+  try {
+    if (err.stack) return String(err.stack);
+  } catch (stackErr) {
+    // ignore
+  }
+  try {
+    if (err.message) return String(err.message);
+  } catch (messageErr) {
+    // ignore
+  }
+  try {
+    return String(err);
+  } catch (stringErr) {
+    return "<unprintable error>";
+  }
+}
+
+function createPaperViewError(code, message, detail) {
+  const err = new Error(message || code || "PaperView error");
+  err.name = "PaperViewError";
+  err.paperView = Object.assign({ code: code || "UNKNOWN_ERROR" }, detail || {});
+  return err;
+}
+
+function isPaperViewError(err) {
+  return !!(err && err.paperView && err.paperView.code);
+}
+
+function safeParseJson(text) {
+  const payload = String(text || "").trim();
+  if (!payload) return null;
+  try {
+    return JSON.parse(payload);
+  } catch (err) {
+    return null;
+  }
+}
+
+function extractHttpStatus(err) {
+  const candidates = [
+    err && err.status,
+    err && err.statusCode,
+    err && err.responseStatus,
+    err && err.xmlhttp && err.xmlhttp.status
+  ];
+  for (const candidate of candidates) {
+    const status = Number(candidate);
+    if (Number.isFinite(status) && status > 0) {
+      return status;
+    }
+  }
+  return null;
+}
+
+function extractResponseText(err) {
+  const candidates = [
+    err && err.responseText,
+    err && err.response,
+    err && err.xmlhttp && err.xmlhttp.responseText,
+    err && err.xmlhttp && err.xmlhttp.response
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate;
+    }
+  }
+  return "";
+}
+
+function isTimeoutLikeError(err) {
+  const text = asErrorText(err).toLowerCase();
+  return /timeout|timed out|time out|ns_error_net_timeout|etimedout/.test(text);
+}
+
+function isConnectionLikeError(err) {
+  const text = asErrorText(err).toLowerCase();
+  return /connection refused|econnrefused|networkerror|failed to fetch|name or service not known|enotfound|dns|ns_error_unknown_host|connection reset|econnreset/.test(text);
+}
+
+function mapServiceErrorCodeToPluginCode(serviceCode) {
+  const code = String(serviceCode || "").trim().toLowerCase();
+  if (!code) return null;
+  const mapping = {
+    api_key_missing: "API_KEY_MISSING",
+    remote_api_timeout: "REMOTE_API_TIMEOUT",
+    remote_api_unreachable: "REMOTE_API_UNREACHABLE",
+    remote_api_auth: "REMOTE_API_AUTH",
+    remote_api_http_error: "REMOTE_API_HTTP_ERROR",
+    ocr_start_failed: "OCR_START_FAILED",
+    ingest_required: "INGEST_REQUIRED",
+    selection_empty: "NO_MATCHING_ITEMS",
+    query_pipeline_failed: "QUERY_PIPELINE_FAILED",
+    ocr_pipeline_failed: "OCR_PIPELINE_FAILED",
+    bad_request: "BAD_REQUEST",
+    internal_error: "INTERNAL_ERROR"
+  };
+  return mapping[code] || null;
+}
+
+function classifyServiceRequestError(err, options) {
+  if (isPaperViewError(err)) return err;
+  const opts = options || {};
+  const status = extractHttpStatus(err);
+  const payload = safeParseJson(extractResponseText(err)) || {};
+  const serviceCode = payload.code || payload.error_code;
+  const mappedCode = mapServiceErrorCodeToPluginCode(serviceCode);
+  const payloadMessage =
+    (typeof payload.error === "string" && payload.error) ||
+    (typeof payload.message === "string" && payload.message) ||
+    "";
+
+  if (mappedCode) {
+    return createPaperViewError(
+      mappedCode,
+      payloadMessage || asErrorText(err),
+      { status, serviceCode, operation: opts.operation || "", raw: asErrorText(err) }
+    );
+  }
+  if (status) {
+    return createPaperViewError(
+      status >= 500 ? "SERVICE_HTTP_5XX" : "SERVICE_HTTP_4XX",
+      payloadMessage || `HTTP ${status}`,
+      { status, operation: opts.operation || "", raw: asErrorText(err) }
+    );
+  }
+  if (isTimeoutLikeError(err)) {
+    return createPaperViewError("SERVICE_TIMEOUT", asErrorText(err), {
+      operation: opts.operation || "",
+      raw: asErrorText(err)
+    });
+  }
+  if (isConnectionLikeError(err)) {
+    return createPaperViewError("SERVICE_UNREACHABLE", asErrorText(err), {
+      operation: opts.operation || "",
+      raw: asErrorText(err)
+    });
+  }
+  return createPaperViewError("REQUEST_FAILED", asErrorText(err), {
+    operation: opts.operation || "",
+    raw: asErrorText(err)
+  });
+}
+
+function formatPaperViewError(err, options) {
+  const opts = options || {};
+  const wrapped = isPaperViewError(err)
+    ? err
+    : createPaperViewError("UNKNOWN_ERROR", asErrorText(err));
+  const detail = wrapped.paperView || {};
+  const code = detail.code || "UNKNOWN_ERROR";
+  const status = Number(detail.status);
+  const serviceUrl = getServiceBaseUrl();
+  const source = detail.apiKeySource || "unknown";
+  const logHint = `服务日志：${getLogPath()}`;
+  const envHint = `环境安装日志：${getEnvLogPath()}`;
+  const manualStartHint = "可在 Tools -> PaperView: Start Service 手动启动服务。";
+
+  let title = opts.title || "PaperView 错误";
+  let message = String(wrapped.message || "未知错误").trim() || "未知错误";
+
+  switch (code) {
+    case "API_KEY_MISSING":
+      title = opts.title || "PaperView 配置缺失";
+      message =
+        "未检测到 API Key。\n请打开 Settings -> PaperView，填写 API Key 后点击 Save，然后重试。\n" +
+        `当前检测来源：${source}`;
+      break;
+    case "SERVICE_START_FAILED":
+      title = opts.title || "PaperView 服务启动失败";
+      message =
+        "本地服务未能成功启动。\n" +
+        `${manualStartHint}\n${logHint}\n${envHint}`;
+      break;
+    case "SERVICE_NOT_READY":
+      title = opts.title || "PaperView 服务未就绪";
+      message =
+        `本地服务在超时时间内未就绪（${serviceUrl}）。\n` +
+        `${manualStartHint}\n${logHint}`;
+      break;
+    case "SERVICE_UNREACHABLE":
+      title = opts.title || "PaperView 无法连接本地服务";
+      message =
+        `无法连接本地服务：${serviceUrl}\n` +
+        `${manualStartHint}\n请检查 Service Base URL 配置。`;
+      break;
+    case "SERVICE_TIMEOUT":
+      title = opts.title || "PaperView 服务响应超时";
+      message = `本地服务请求超时：${serviceUrl}\n请稍后重试，或检查服务状态。\n${logHint}`;
+      break;
+    case "REMOTE_API_UNREACHABLE":
+      title = opts.title || "PaperView 无法连接远程 API";
+      message = "无法连接远程 API。请检查 LLM Base URL、网络和代理配置。";
+      break;
+    case "REMOTE_API_TIMEOUT":
+      title = opts.title || "PaperView 远程 API 超时";
+      message = "远程 API 响应超时。请检查网络质量，或增大重试等待时间后重试。";
+      break;
+    case "REMOTE_API_AUTH":
+      title = opts.title || "PaperView 远程 API 鉴权失败";
+      message = "远程 API 返回鉴权错误（通常是 API Key 无效或权限不足）。请检查 API Key。";
+      break;
+    case "REMOTE_API_HTTP_ERROR":
+      title = opts.title || "PaperView 远程 API 错误";
+      message = status ? `远程 API 返回 HTTP ${status}。请检查 Base URL、Model 与服务状态。` : "远程 API 返回异常状态。";
+      break;
+    case "OCR_START_FAILED":
+      title = opts.title || "PaperView OCR 启动失败";
+      message = `OCR 任务启动失败，请检查 OCR 依赖和输入文件。\n${logHint}`;
+      break;
+    case "OCR_PIPELINE_FAILED":
+      title = opts.title || "PaperView OCR 失败";
+      message = `OCR 处理失败，请检查输入 PDF 和日志。\n${logHint}`;
+      break;
+    case "QUERY_PIPELINE_FAILED":
+      title = opts.title || "PaperView 查询失败";
+      message = `查询任务执行失败，请检查远程 API 配置和服务日志。\n${logHint}`;
+      break;
+    case "INGEST_REQUIRED":
+      title = opts.title || "PaperView 缺少索引数据";
+      message = "未找到 items 快照，请先在插件中执行一次 ingest/查询后重试。";
+      break;
+    case "NO_MATCHING_ITEMS":
+      title = opts.title || "PaperView 未找到匹配条目";
+      message = "当前选择条目未写入索引，或 key 不匹配。请重新选择条目后重试。";
+      break;
+    case "SERVICE_HTTP_4XX":
+    case "BAD_REQUEST":
+      title = opts.title || "PaperView 请求参数错误";
+      message = status ? `服务返回 HTTP ${status}。\n请检查当前输入配置后重试。` : message;
+      break;
+    case "SERVICE_HTTP_5XX":
+    case "INTERNAL_ERROR":
+      title = opts.title || "PaperView 服务内部错误";
+      message = `本地服务返回内部错误。\n${logHint}`;
+      break;
+    case "RUNTIME_CHECK_FAILED":
+      title = opts.title || "PaperView Runtime 检查失败";
+      message = "Runtime 检查失败，请确认 Service Base URL 和 API 配置。";
+      break;
+    default:
+      break;
+  }
+
+  if (detail.hint) {
+    message += `\n${detail.hint}`;
+  }
+  return { title, message, code, detail };
+}
+
+function showPaperViewError(err, options) {
+  const normalized = formatPaperViewError(err, options);
+  const detailText = asErrorText(err);
+  Zotero.debug(
+    `[PaperView][error] code=${normalized.code} detail=${detailText}`
+  );
+  showPaperViewAlert(normalized.message, normalized.title);
+}
+
+async function runWithPaperViewErrorAlert(action, options) {
+  try {
+    return await action();
+  } catch (err) {
+    showPaperViewError(err, options);
+    return null;
+  }
+}
+
+function resolveApiKeyFromPrefsOrEnv() {
+  const prefApiKey = String(getApiKey() || "").trim();
+  if (prefApiKey) {
+    return { apiKey: prefApiKey, source: "prefs" };
+  }
+  let envApiKey = "";
+  try {
+    envApiKey = String(
+      (
+        (Services.env && Services.env.get("SILICONFLOW_API_KEY")) ||
+        (Services.env && Services.env.get("OPENAI_API_KEY")) ||
+        ""
+      )
+    ).trim();
+  } catch (err) {
+    envApiKey = "";
+  }
+  if (envApiKey) {
+    return { apiKey: envApiKey, source: "env" };
+  }
+  return { apiKey: "", source: "none" };
+}
+
 function syncRuntimeConfigAndEnv(options) {
   const opts = options || {};
   const requireApiKey = !!opts.requireApiKey;
   const cfg = normalizeLlmConfig(getCurrentLlmConfig());
-  let apiKey = String(cfg.api_key || "").trim();
-  if (!apiKey) {
-    apiKey = String(getApiKey() || "").trim();
+  const resolved = resolveApiKeyFromPrefsOrEnv();
+  if (resolved.apiKey) {
+    cfg.api_key = resolved.apiKey;
   }
-  if (!apiKey) {
-    try {
-      apiKey = String(
-        (Services.env && (Services.env.get("SILICONFLOW_API_KEY") || Services.env.get("OPENAI_API_KEY"))) ||
-        ""
-      ).trim();
-    } catch (err) {
-      apiKey = "";
-    }
-  }
-  if (apiKey) {
-    cfg.api_key = apiKey;
-  }
+  Zotero.debug(`[PaperView] api_key_source=${resolved.source}`);
   writeLlmConfigFile(cfg);
   try {
     Services.env.set("PAPERVIEW_LLM_CONFIG", getLlmConfigPath());
@@ -199,7 +494,14 @@ function syncRuntimeConfigAndEnv(options) {
     }
   }
   if (requireApiKey && !cfg.api_key) {
-    throw new Error("未检测到 API Key。请在 Settings -> PaperView 填写 API Key，并点击 Save。");
+    throw createPaperViewError(
+      "API_KEY_MISSING",
+      "missing api key",
+      {
+        apiKeySource: resolved.source,
+        hint: "如果你在 macOS 从 Dock/Finder 启动 Zotero，shell 环境变量通常不可见，建议直接在设置页填写 API Key。"
+      }
+    );
   }
   return cfg;
 }
@@ -570,16 +872,16 @@ function applyPrefsPaneState(doc, state) {
   if (retry429Node) retry429Node.checked = !!s.retryOn429;
 }
 
-function readPrefsPaneState(doc) {
+function readPrefsPaneRawState(doc) {
   const getValue = (id) => {
     const node = doc.getElementById(id);
-    return node ? node.value : "";
+    return node ? String(node.value || "") : "";
   };
   const getChecked = (id) => {
     const node = doc.getElementById(id);
     return !!(node && node.checked);
   };
-  return normalizePrefsPaneState({
+  return {
     serviceURL: getValue("paperview-service-url"),
     apiKey: getValue("paperview-api-key"),
     llmBaseURL: getValue("paperview-llm-base-url"),
@@ -590,14 +892,129 @@ function readPrefsPaneState(doc) {
     ocrConcurrency: getValue("paperview-llm-ocr-concurrency"),
     retryWaitS: getValue("paperview-llm-retry-wait"),
     retryOn429: getChecked("paperview-llm-retry-on-429")
-  });
+  };
 }
 
-function setPrefsPaneStatus(doc, message, isError) {
+function readPrefsPaneState(doc) {
+  return normalizePrefsPaneState(readPrefsPaneRawState(doc));
+}
+
+function validatePrefsPaneRawState(raw) {
+  const issues = [];
+  const addIssue = (fieldId, message, level) => {
+    issues.push({ fieldId, message, level: level || "error" });
+  };
+
+  const requireHttpUrl = (fieldId, label, value) => {
+    const text = String(value || "").trim();
+    if (!text) {
+      addIssue(fieldId, `${label} is required`, "error");
+      return;
+    }
+    try {
+      const url = new URL(text);
+      if (!/^https?:$/i.test(url.protocol)) {
+        addIssue(fieldId, `${label} must use http/https`, "error");
+      }
+    } catch (err) {
+      addIssue(fieldId, `${label} is not a valid URL`, "error");
+    }
+  };
+
+  const requireNumberInRange = (fieldId, label, value, min, max, integerOnly) => {
+    const text = String(value || "").trim();
+    if (!text) {
+      addIssue(fieldId, `${label} is required`, "error");
+      return;
+    }
+    const n = Number(text);
+    if (!Number.isFinite(n)) {
+      addIssue(fieldId, `${label} must be a number`, "error");
+      return;
+    }
+    if (integerOnly && !Number.isInteger(n)) {
+      addIssue(fieldId, `${label} must be an integer`, "error");
+      return;
+    }
+    if (n < min || n > max) {
+      addIssue(fieldId, `${label} must be between ${min} and ${max}`, "error");
+    }
+  };
+
+  requireHttpUrl("paperview-service-url", "Service Base URL", raw.serviceURL);
+  requireHttpUrl("paperview-llm-base-url", "LLM Base URL", raw.llmBaseURL);
+  if (!String(raw.llmModel || "").trim()) {
+    addIssue("paperview-llm-model", "Model is required", "error");
+  }
+  requireNumberInRange("paperview-llm-temperature", "Temperature", raw.temperature, 0, 2, false);
+  requireNumberInRange("paperview-llm-max-output-tokens", "Max Output Tokens", raw.maxOutputTokens, 1, 32768, true);
+  requireNumberInRange("paperview-llm-concurrency", "Query Concurrency", raw.concurrency, 1, 64, true);
+  requireNumberInRange("paperview-llm-ocr-concurrency", "OCR Concurrency", raw.ocrConcurrency, 1, 64, true);
+  requireNumberInRange("paperview-llm-retry-wait", "Retry Wait (s)", raw.retryWaitS, 0, 7200, true);
+
+  if (!String(raw.apiKey || "").trim()) {
+    addIssue(
+      "paperview-api-key",
+      "API Key is empty. Runtime requests may fail unless another valid key source is available.",
+      "warning"
+    );
+  }
+  return issues;
+}
+
+function applyPrefsPaneValidationUI(doc, issues) {
+  const errorFields = new Set(
+    issues.filter((issue) => issue.level === "error").map((issue) => issue.fieldId)
+  );
+  const warningFields = new Set(
+    issues.filter((issue) => issue.level === "warning").map((issue) => issue.fieldId)
+  );
+  for (const id of PREFS_FIELD_IDS) {
+    const node = doc.getElementById(id);
+    if (!node || !node.style) continue;
+    if (errorFields.has(id)) {
+      node.style.borderColor = "#dc2626";
+    } else if (warningFields.has(id)) {
+      node.style.borderColor = "#d97706";
+    } else {
+      node.style.borderColor = "#cbd5e1";
+    }
+  }
+}
+
+function collectPrefsPaneValidation(doc) {
+  const raw = readPrefsPaneRawState(doc);
+  const normalized = normalizePrefsPaneState(raw);
+  const issues = validatePrefsPaneRawState(raw);
+  applyPrefsPaneValidationUI(doc, issues);
+  const errors = issues.filter((issue) => issue.level === "error");
+  const warnings = issues.filter((issue) => issue.level === "warning");
+  return { raw, normalized, issues, errors, warnings };
+}
+
+function setPrefsPaneStatus(doc, message, level) {
   const node = doc.getElementById("paperview-pref-status");
   if (!node) return;
-  node.setAttribute("value", message || "");
-  node.style.color = isError ? "#842029" : "#475569";
+  let mode = level;
+  if (mode === true) mode = "error";
+  if (mode === false || !mode) mode = "info";
+  const palette = {
+    info: "#475569",
+    success: "#166534",
+    warning: "#92400e",
+    error: "#842029"
+  };
+  const text = String(message || "");
+  if (node.localName === "label") {
+    node.setAttribute("value", text);
+  } else if (typeof node.textContent === "string" || node.textContent === "") {
+    node.textContent = text;
+  } else {
+    node.setAttribute("value", text);
+  }
+  node.style.color = palette[mode] || palette.info;
+  node.style.whiteSpace = "pre-wrap";
+  node.style.lineHeight = "1.35";
 }
 
 function persistPrefsPaneState(state) {
@@ -630,6 +1047,37 @@ function persistPrefsPaneState(state) {
   writeLlmConfigFile(cfg);
 }
 
+function formatPrefsPaneErrorSummary(err) {
+  if (isPaperViewError(err)) {
+    const code = err.paperView.code;
+    switch (code) {
+      case "API_KEY_MISSING":
+        return "API Key is missing. Fill API Key and click Save.";
+      case "SERVICE_UNREACHABLE":
+        return "Cannot reach local PaperView service.";
+      case "SERVICE_TIMEOUT":
+        return "Local PaperView service request timed out.";
+      case "SERVICE_NOT_READY":
+        return "Local PaperView service is not ready.";
+      case "SERVICE_START_FAILED":
+        return "Failed to start local PaperView service.";
+      case "REMOTE_API_UNREACHABLE":
+        return "Cannot reach remote API.";
+      case "REMOTE_API_TIMEOUT":
+        return "Remote API request timed out.";
+      case "REMOTE_API_AUTH":
+        return "Remote API authentication failed.";
+      case "REMOTE_API_HTTP_ERROR":
+        return "Remote API returned an HTTP error.";
+      default:
+        break;
+    }
+  }
+  const text = asErrorText(err).trim();
+  if (!text) return "Unexpected error.";
+  return text.split("\n")[0];
+}
+
 function initPrefsPaneWindow(win) {
   try {
     const doc = win && win.document;
@@ -640,23 +1088,56 @@ function initPrefsPaneWindow(win) {
     const current = getPrefsPaneState();
     applyPrefsPaneState(doc, current);
     persistPrefsPaneState(current);
-    setPrefsPaneStatus(doc, "Defaults loaded. Click Save after changes.", false);
+    setPrefsPaneStatus(doc, "Defaults loaded. Click Save after changes.", "info");
 
     if (root.getAttribute("data-paperview-bound") === "true") {
       return;
     }
 
-    const onSave = () => {
+    const runPaneAction = async (buttonId, handler) => {
+      const btn = buttonId ? doc.getElementById(buttonId) : null;
+      const originalDisabled = btn ? !!btn.disabled : false;
+      if (btn) btn.disabled = true;
       try {
-        const next = readPrefsPaneState(doc);
-        persistPrefsPaneState(next);
-        applyPrefsPaneState(doc, next);
-        setPrefsPaneStatus(doc, "Saved.", false);
-        Zotero.debug("[PaperView] preferences saved");
+        await handler();
       } catch (err) {
-        setPrefsPaneStatus(doc, `Save failed: ${err}`, true);
-        Zotero.debug(`[PaperView] preferences save failed: ${err}`);
+        setPrefsPaneStatus(doc, `Failed: ${formatPrefsPaneErrorSummary(err)}`, "error");
+        Zotero.debug(`[PaperView] settings action failed: ${asErrorText(err)}`);
+      } finally {
+        if (btn) btn.disabled = originalDisabled;
       }
+    };
+
+    const refreshValidationHint = (preferInfo) => {
+      const validation = collectPrefsPaneValidation(doc);
+      if (validation.errors.length) {
+        setPrefsPaneStatus(doc, `Validation failed: ${validation.errors[0].message}`, "error");
+      } else if (validation.warnings.length) {
+        setPrefsPaneStatus(doc, validation.warnings[0].message, "warning");
+      } else if (preferInfo) {
+        setPrefsPaneStatus(doc, "Configuration looks good.", "info");
+      }
+      return validation;
+    };
+
+    const onSave = async () => {
+      const validation = refreshValidationHint(false);
+      if (validation.errors.length) {
+        return;
+      }
+      persistPrefsPaneState(validation.normalized);
+      applyPrefsPaneState(doc, validation.normalized);
+      const needsRestart = isServiceRunning();
+      if (needsRestart) {
+        setPrefsPaneStatus(
+          doc,
+          "Saved.\nService is running. Click Restart Service to apply changes.",
+          validation.warnings.length ? "warning" : "success"
+        );
+      } else {
+        setPrefsPaneStatus(doc, "Saved.", validation.warnings.length ? "warning" : "success");
+      }
+      Zotero.debug("[PaperView] preferences saved");
     };
 
     const onReset = () => {
@@ -664,16 +1145,94 @@ function initPrefsPaneWindow(win) {
         const defaults = getPrefsPaneDefaults();
         applyPrefsPaneState(doc, defaults);
         persistPrefsPaneState(defaults);
-        setPrefsPaneStatus(doc, "Defaults restored.", false);
+        refreshValidationHint(false);
+        setPrefsPaneStatus(doc, "Defaults restored.", "success");
       } catch (err) {
-        setPrefsPaneStatus(doc, `Reset failed: ${err}`, true);
+        setPrefsPaneStatus(doc, `Reset failed: ${err}`, "error");
       }
+    };
+
+    const onCheckRuntime = async () => {
+      const validation = refreshValidationHint(false);
+      if (validation.errors.length) return;
+      setPrefsPaneStatus(doc, "Checking runtime...", "info");
+      const runtime = await runRuntimeCheck(validation.normalized, { checkRemote: false });
+      const info = runtime && runtime.runtime ? runtime.runtime : {};
+      const source = formatApiKeySource(info.api_key_source);
+      const envVisible = info.env_visible ? "visible" : "not-visible";
+      const profile = info.profile || "";
+      const platform = info.platform || "unknown";
+      let message = `Runtime check passed.\nAPI key source: ${source}\nEnvironment: ${envVisible}\nPlatform: ${platform}`;
+      if (profile) {
+        message += `\nProfile: ${profile}`;
+      }
+      setPrefsPaneStatus(doc, message, "success");
+    };
+
+    const onTestConnection = async () => {
+      const validation = refreshValidationHint(false);
+      if (validation.errors.length) return;
+      setPrefsPaneStatus(doc, "Testing API connection...", "info");
+      const result = await runRuntimeCheck(validation.normalized, { checkRemote: true });
+      const runtime = result && result.runtime ? result.runtime : {};
+      const remote = result && result.remote ? result.remote : {};
+      const source = formatApiKeySource(runtime.api_key_source);
+      const latency = Number(remote.latency_ms);
+      const latencyText = Number.isFinite(latency) ? `${latency}ms` : "n/a";
+      setPrefsPaneStatus(
+        doc,
+        `Connection test passed.\nSource: ${source}\nLatency: ${latencyText}\nModel: ${remote.model || validation.normalized.llmModel}`,
+        "success"
+      );
+    };
+
+    const onRestartService = async () => {
+      setPrefsPaneStatus(doc, "Restarting service...", "info");
+      stopService();
+      await startService();
+      await ensureServiceReady();
+      setPrefsPaneStatus(doc, "Service restarted.", "success");
     };
 
     const saveBtn = doc.getElementById("paperview-pref-save");
     const resetBtn = doc.getElementById("paperview-pref-reset");
-    if (saveBtn) saveBtn.addEventListener("command", onSave);
+    const runtimeBtn = doc.getElementById("paperview-pref-check-runtime");
+    const testBtn = doc.getElementById("paperview-pref-test-connection");
+    const restartBtn = doc.getElementById("paperview-pref-restart-service");
+    if (saveBtn) {
+      saveBtn.addEventListener("command", () => {
+        void runPaneAction("paperview-pref-save", onSave);
+      });
+    }
     if (resetBtn) resetBtn.addEventListener("command", onReset);
+    if (runtimeBtn) {
+      runtimeBtn.addEventListener("command", () => {
+        void runPaneAction("paperview-pref-check-runtime", onCheckRuntime);
+      });
+    }
+    if (testBtn) {
+      testBtn.addEventListener("command", () => {
+        void runPaneAction("paperview-pref-test-connection", onTestConnection);
+      });
+    }
+    if (restartBtn) {
+      restartBtn.addEventListener("command", () => {
+        void runPaneAction("paperview-pref-restart-service", onRestartService);
+      });
+    }
+
+    for (const id of PREFS_FIELD_IDS) {
+      const input = doc.getElementById(id);
+      if (!input || typeof input.addEventListener !== "function") continue;
+      input.addEventListener("input", () => {
+        refreshValidationHint(true);
+      });
+      input.addEventListener("change", () => {
+        refreshValidationHint(true);
+      });
+    }
+
+    refreshValidationHint(true);
 
     root.setAttribute("data-paperview-bound", "true");
     Zotero.debug("[PaperView] preferences pane initialized");
@@ -1005,8 +1564,8 @@ async function ensureEnvReady() {
 }
 
 async function startService() {
-  if (serviceStarting) return;
-  if (serviceProcess && serviceProcess.isRunning) return;
+  if (serviceProcess && serviceProcess.isRunning) return true;
+  if (serviceStarting) return false;
   serviceStarting = true;
   try {
     // Sync runtime config from Zotero preferences before launching service.
@@ -1040,9 +1599,15 @@ async function startService() {
     serviceProcess = proc;
     Zotero.debug(`[PaperView] service started at ${host}:${port}`);
     Zotero.debug(`[PaperView] service log: ${getLogPath()}`);
+    return true;
   } catch (err) {
     Zotero.debug(`[PaperView] start service error: ${err}`);
-    showPaperViewAlert(`服务启动失败：${err}\n请检查日志：${getLogPath()}`);
+    serviceProcess = null;
+    throw createPaperViewError("SERVICE_START_FAILED", asErrorText(err), {
+      logPath: getLogPath(),
+      envLogPath: getEnvLogPath(),
+      pipLogPath: getPipLogPath()
+    });
   } finally {
     serviceStarting = false;
   }
@@ -1074,8 +1639,7 @@ async function pingServiceHealth() {
       headers: { "Content-Type": "application/json" },
       timeout: 2000
     });
-    const text = resp.responseText || resp.response || "";
-    const data = text ? JSON.parse(text) : {};
+    const data = parseJsonResponse(resp);
     return !!(data && data.ok);
   } catch (err) {
     return false;
@@ -1105,7 +1669,10 @@ async function ensureServiceReady() {
     await startService();
     const ready = await waitServiceReady(90000, 800);
     if (!ready) {
-      throw new Error(`Service not ready in time. Check log: ${getLogPath()}`);
+      throw createPaperViewError("SERVICE_NOT_READY", "service not ready in time", {
+        logPath: getLogPath(),
+        baseUrl: getServiceBaseUrl()
+      });
     }
     Zotero.debug("[PaperView] service is ready");
     return true;
@@ -1353,7 +1920,69 @@ async function promptQueryText() {
 
 function parseJsonResponse(resp) {
   const text = resp.responseText || resp.response || "";
-  return text ? JSON.parse(text) : {};
+  if (!String(text || "").trim()) {
+    return {};
+  }
+  const parsed = safeParseJson(text);
+  if (parsed === null) {
+    throw createPaperViewError("INVALID_JSON_RESPONSE", "invalid json response", {
+      responseText: String(text || "").slice(0, 600)
+    });
+  }
+  return parsed;
+}
+
+async function requestServiceJSON(method, path, payload, options) {
+  const opts = options || {};
+  const baseUrl = opts.baseUrl || getServiceBaseUrl();
+  const url = `${baseUrl}${path}`;
+  const reqOptions = {
+    headers: { "Content-Type": "application/json" },
+    timeout: Number(opts.timeoutMs) || DEFAULT_SERVICE_REQUEST_TIMEOUT_MS
+  };
+  if (payload !== undefined && payload !== null) {
+    reqOptions.body = JSON.stringify(payload);
+  }
+  try {
+    const resp = await Zotero.HTTP.request(method, url, reqOptions);
+    return parseJsonResponse(resp);
+  } catch (err) {
+    throw classifyServiceRequestError(err, { operation: opts.operation || path });
+  }
+}
+
+function formatApiKeySource(source) {
+  const key = String(source || "").trim().toLowerCase();
+  if (key === "prefs") return "prefs";
+  if (key === "env") return "env";
+  if (key === "request") return "request";
+  return "none";
+}
+
+async function runRuntimeCheck(state, options) {
+  const opts = options || {};
+  await ensureServiceReady();
+  const payload = {
+    base_url: state.llmBaseURL,
+    model: state.llmModel,
+    api_key: state.apiKey,
+    timeout_s: DEFAULT_RUNTIME_TEST_TIMEOUT_S,
+    check_remote: !!opts.checkRemote
+  };
+  const data = await requestServiceJSON("POST", "/runtime/check", payload, {
+    timeoutMs: Math.max(8000, DEFAULT_RUNTIME_TEST_TIMEOUT_S * 1000 + 4000),
+    operation: opts.checkRemote ? "runtime_test_connection" : "runtime_check"
+  });
+  if (data && data.ok) {
+    return data;
+  }
+  const serviceCode = data && data.code;
+  const mappedCode = mapServiceErrorCodeToPluginCode(serviceCode) || "RUNTIME_CHECK_FAILED";
+  throw createPaperViewError(mappedCode, (data && data.error) || "runtime check failed", {
+    serviceCode,
+    status: Number(data && data.status) || null,
+    apiKeySource: data && data.runtime && data.runtime.api_key_source
+  });
 }
 
 function summarizeIngestResult(ingest) {
@@ -1371,7 +2000,6 @@ function summarizeIngestResult(ingest) {
 }
 
 async function ingestItems(items) {
-  const baseUrl = getServiceBaseUrl();
   const payload = {
     items: items.map(buildItemPayload),
     client: {
@@ -1379,44 +2007,43 @@ async function ingestItems(items) {
       zotero_version: Zotero.version
     }
   };
-  const resp = await Zotero.HTTP.request("POST", `${baseUrl}/ingest`, {
-    body: JSON.stringify(payload),
-    headers: { "Content-Type": "application/json" }
+  return requestServiceJSON("POST", "/ingest", payload, {
+    timeoutMs: DEFAULT_SERVICE_REQUEST_TIMEOUT_MS,
+    operation: "ingest"
   });
-  return parseJsonResponse(resp);
 }
 
 async function queryService(itemKeys, queryText, sectionsText, queryMode) {
-  const baseUrl = getServiceBaseUrl();
   const payload = {
     item_keys: itemKeys,
     query: queryText,
     sections: sectionsText || "",
     query_mode: queryMode || "single"
   };
-  const resp = await Zotero.HTTP.request("POST", `${baseUrl}/query`, {
-    body: JSON.stringify(payload),
-    headers: { "Content-Type": "application/json" }
+  const data = await requestServiceJSON("POST", "/query", payload, {
+    timeoutMs: DEFAULT_SERVICE_REQUEST_TIMEOUT_MS,
+    operation: "query_submit"
   });
-  const data = parseJsonResponse(resp);
   if (!data || !data.result_url) {
-    throw new Error("Missing result_url in response");
+    throw createPaperViewError("BAD_RESPONSE", "missing result_url in /query response");
   }
   return data;
 }
 
 async function ocrService(itemKeys) {
-  const baseUrl = getServiceBaseUrl();
   const cfg = getCurrentLlmConfig();
   const payload = {
     item_keys: itemKeys,
     ocr_concurrency: cfg.ocr_concurrency
   };
-  const resp = await Zotero.HTTP.request("POST", `${baseUrl}/ocr`, {
-    body: JSON.stringify(payload),
-    headers: { "Content-Type": "application/json" }
+  const data = await requestServiceJSON("POST", "/ocr", payload, {
+    timeoutMs: DEFAULT_SERVICE_REQUEST_TIMEOUT_MS,
+    operation: "ocr_submit"
   });
-  return parseJsonResponse(resp);
+  if (!data || !data.job_id) {
+    throw createPaperViewError("OCR_START_FAILED", "missing job_id in /ocr response");
+  }
+  return data;
 }
 
 async function runQueryForSelectedItems(queryMode) {
@@ -1452,7 +2079,6 @@ async function runQueryForSelectedItems(queryMode) {
 // Shared job polling UI for query/ocr tasks.
 async function showJobProgress(jobId, options) {
   const opts = options || {};
-  const baseUrl = getServiceBaseUrl();
   const win = Zotero.getMainWindow();
   if (!win) return;
 
@@ -1465,6 +2091,7 @@ async function showJobProgress(jobId, options) {
 
   let stopped = false;
   let timer = null;
+  let pollErrorCount = 0;
   const stopPolling = () => {
     if (stopped) return;
     stopped = true;
@@ -1477,10 +2104,11 @@ async function showJobProgress(jobId, options) {
   const update = async () => {
     if (stopped) return;
     try {
-      const resp = await Zotero.HTTP.request("GET", `${baseUrl}/status/${jobId}`, {
-        headers: { "Content-Type": "application/json" }
+      const data = await requestServiceJSON("GET", `/status/${jobId}`, null, {
+        timeoutMs: DEFAULT_STATUS_POLL_TIMEOUT_MS,
+        operation: "job_status_poll"
       });
-      const data = parseJsonResponse(resp);
+      pollErrorCount = 0;
       const stage = data.stage || opts.defaultStage || "job";
       const done = Number(data.done || 0);
       const total = Number(data.total || 0);
@@ -1508,13 +2136,27 @@ async function showJobProgress(jobId, options) {
       if (stage === "error") {
         stopPolling();
         progress.setProgress(100);
+        const serviceCode = data.error_code || data.code || "";
+        const mappedCode = mapServiceErrorCodeToPluginCode(serviceCode);
         const finalMsg = rawMsg || `未知错误，请检查日志：${getLogPath()}`;
         progress.setText(`失败 ${finalMsg}`.trim());
         pw.close();
-        showPaperViewAlert(`${opts.errorPrefix || "任务失败"}: ${finalMsg}`);
+        const error = createPaperViewError(
+          mappedCode || (opts.defaultStage === "ocr" ? "OCR_PIPELINE_FAILED" : "QUERY_PIPELINE_FAILED"),
+          finalMsg,
+          { serviceCode, stage }
+        );
+        showPaperViewError(error, { title: opts.errorPrefix || "任务失败" });
       }
     } catch (err) {
-      progress.setText("等待服务响应...");
+      pollErrorCount += 1;
+      if (pollErrorCount >= DEFAULT_STATUS_POLL_MAX_ERRORS) {
+        stopPolling();
+        pw.close();
+        showPaperViewError(err, { title: opts.errorPrefix || "任务失败" });
+        return;
+      }
+      progress.setText(`等待服务响应...(${pollErrorCount}/${DEFAULT_STATUS_POLL_MAX_ERRORS})`);
     }
   };
 
@@ -1557,11 +2199,10 @@ function attachMenuToWindow(win) {
       applyMenuIcon(menuitem);
 
       const onCommand = async () => {
-        try {
-          await runQueryForSelectedItems("single");
-        } catch (err) {
-          Zotero.debug(`[PaperView] onCommand error: ${err}`);
-        }
+        await runWithPaperViewErrorAlert(
+          () => runQueryForSelectedItems("single"),
+          { title: "PaperView 查询失败" }
+        );
       };
 
       const onPopupShowing = () => {
@@ -1593,11 +2234,10 @@ function attachMenuToWindow(win) {
       applyMenuIcon(concatItem);
 
       const onConcatCommand = async () => {
-        try {
-          await runQueryForSelectedItems("merge");
-        } catch (err) {
-          Zotero.debug(`[PaperView] onConcatCommand error: ${err}`);
-        }
+        await runWithPaperViewErrorAlert(
+          () => runQueryForSelectedItems("merge"),
+          { title: "PaperView Concat 查询失败" }
+        );
       };
 
       concatItem.addEventListener("command", onConcatCommand);
@@ -1619,7 +2259,7 @@ function attachMenuToWindow(win) {
       applyMenuIcon(ocrItem);
 
       const onOcrCommand = async () => {
-        try {
+        await runWithPaperViewErrorAlert(async () => {
           await ensureServiceReady();
           const items = Zotero.getActiveZoteroPane().getSelectedItems();
           const keys = items.map((item) => item.key);
@@ -1633,9 +2273,7 @@ function attachMenuToWindow(win) {
           if (result && result.job_id) {
             await showOcrProgress(result.job_id);
           }
-        } catch (err) {
-          Zotero.debug(`[PaperView] OCR command error: ${err}`);
-        }
+        }, { title: "PaperView OCR 失败" });
       };
 
       const onOcrPopupShowing = () => {
@@ -1664,14 +2302,11 @@ function attachMenuToWindow(win) {
       applyMenuIcon(historyItem);
 
       const onHistoryCommand = () => {
-        ensureServiceReady()
-          .then(() => {
-            const baseUrl = getServiceBaseUrl();
-            Zotero.launchURL(`${baseUrl}/query_view.html`);
-          })
-          .catch((err) => {
-            Zotero.debug(`[PaperView] history command error: ${err}`);
-          });
+        void runWithPaperViewErrorAlert(async () => {
+          await ensureServiceReady();
+          const baseUrl = getServiceBaseUrl();
+          Zotero.launchURL(`${baseUrl}/query_view.html`);
+        }, { title: "PaperView 历史查询失败" });
       };
 
       historyItem.addEventListener("command", onHistoryCommand);
@@ -1702,8 +2337,10 @@ function attachToolsMenuToWindow(win) {
       startServiceItem.setAttribute("id", "paperview-tools-start-service");
       startServiceItem.setAttribute("label", MENU_LABELS.startService);
       applyMenuIcon(startServiceItem);
-      const onStartService = () => {
-        startService();
+      const onStartService = async () => {
+        await runWithPaperViewErrorAlert(() => startService(), {
+          title: "PaperView 服务启动失败"
+        });
       };
       startServiceItem.addEventListener("command", onStartService);
       toolsMenu.appendChild(startServiceItem);

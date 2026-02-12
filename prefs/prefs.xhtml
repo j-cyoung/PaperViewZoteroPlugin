@@ -102,10 +102,18 @@
       <checkbox id="paperview-llm-retry-on-429" />
     </hbox>
 
-    <hbox align="center" style="margin-top: 8px;">
-      <button id="paperview-pref-save" label="Save" />
-      <button id="paperview-pref-reset" label="Reset Defaults" />
-      <label id="paperview-pref-status" value="" style="margin-left: 8px; color: #475569;" />
-    </hbox>
+    <vbox style="margin-top: 8px; gap: 6px;">
+      <hbox align="center">
+        <button id="paperview-pref-save" label="Save" />
+        <button id="paperview-pref-reset" label="Reset Defaults" />
+        <button id="paperview-pref-check-runtime" label="Check Runtime" />
+        <button id="paperview-pref-test-connection" label="Test Connection" />
+        <button id="paperview-pref-restart-service" label="Restart Service" />
+      </hbox>
+      <html:div
+        id="paperview-pref-status"
+        style="color: #475569; white-space: pre-wrap; line-height: 1.35; min-height: 1.35em; max-width: 760px;"
+      />
+    </vbox>
   </groupbox>
 </vbox>

@@ -11,12 +11,16 @@ import uuid
 import re
 import threading
 import time
+import requests
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
 DEFAULT_OCR_CONCURRENCY = 4
+DEFAULT_RUNTIME_TEST_TIMEOUT_S = 20
+DEFAULT_REMOTE_BASE_URL = "https://api.siliconflow.cn/v1"
+DEFAULT_REMOTE_MODEL = "Qwen/Qwen2.5-72B-Instruct"
 OCR_CACHE_LOCK = threading.Lock()
 
 
@@ -148,16 +152,100 @@ class DemoHandler(BaseHTTPRequestHandler):
             default=DEFAULT_OCR_CONCURRENCY,
         )
 
+    def _resolve_api_key_with_source(self, payload=None):
+        cfg = self._load_runtime_config()
+        req = payload if isinstance(payload, dict) else {}
+
+        req_key = self._pick_non_empty_str(req.get("api_key"), default="")
+        if req_key:
+            return req_key, "request"
+
+        cfg_key = self._pick_non_empty_str(cfg.get("api_key"), default="")
+        if cfg_key:
+            return cfg_key, "prefs"
+
+        env_sf = self._pick_non_empty_str(os.environ.get("SILICONFLOW_API_KEY"), default="")
+        if env_sf:
+            return env_sf, "env"
+
+        env_openai = self._pick_non_empty_str(os.environ.get("OPENAI_API_KEY"), default="")
+        if env_openai:
+            return env_openai, "env"
+
+        return "", "none"
+
     def _resolve_api_key(self, payload=None):
+        key, _source = self._resolve_api_key_with_source(payload)
+        return key
+
+    def _resolve_runtime_base_url(self, payload=None):
+        cfg = self._load_runtime_config()
+        req = payload if isinstance(payload, dict) else {}
+        value = self._pick_non_empty_str(
+            req.get("base_url"),
+            cfg.get("base_url"),
+            os.environ.get("PAPERVIEW_LLM_BASE_URL"),
+            default=DEFAULT_REMOTE_BASE_URL,
+        )
+        return value.rstrip("/")
+
+    def _resolve_runtime_model(self, payload=None):
         cfg = self._load_runtime_config()
         req = payload if isinstance(payload, dict) else {}
         return self._pick_non_empty_str(
-            req.get("api_key"),
-            cfg.get("api_key"),
-            os.environ.get("SILICONFLOW_API_KEY"),
-            os.environ.get("OPENAI_API_KEY"),
-            default="",
+            req.get("model"),
+            cfg.get("model"),
+            os.environ.get("PAPERVIEW_LLM_MODEL"),
+            default=DEFAULT_REMOTE_MODEL,
         )
+
+    def _resolve_runtime_timeout_s(self, payload=None):
+        req = payload if isinstance(payload, dict) else {}
+        timeout = self._pick_positive_int(
+            req.get("timeout_s"),
+            default=DEFAULT_RUNTIME_TEST_TIMEOUT_S,
+        )
+        return max(3, min(timeout, 120))
+
+    def _classify_exception(self, err, stage=""):
+        text = str(err or "").strip() or repr(err)
+        lower = text.lower()
+        stage_l = str(stage or "").lower()
+        code = "internal_error"
+
+        if "remote_api_timeout" in lower:
+            code = "remote_api_timeout"
+        elif "remote_api_unreachable" in lower:
+            code = "remote_api_unreachable"
+        elif "remote_api_auth" in lower:
+            code = "remote_api_auth"
+        elif "remote_api_http_error" in lower:
+            code = "remote_api_http_error"
+        elif "missing api key" in lower:
+            code = "api_key_missing"
+        elif "items.jsonl not found" in lower:
+            code = "ingest_required"
+        elif "no matching items" in lower:
+            code = "selection_empty"
+        elif "pdf_to_md_pymupdf4llm failed" in lower:
+            code = "ocr_start_failed"
+        elif "timed out" in lower or "timeout" in lower:
+            code = "remote_api_timeout"
+        elif "connection refused" in lower or "failed to establish a new connection" in lower:
+            code = "remote_api_unreachable"
+        elif "name or service not known" in lower or "temporary failure in name resolution" in lower:
+            code = "remote_api_unreachable"
+        elif "max retries exceeded" in lower and ("http" in lower or "https" in lower):
+            code = "remote_api_unreachable"
+        elif "401" in lower or "403" in lower or "unauthorized" in lower or "forbidden" in lower:
+            code = "remote_api_auth"
+        elif "query_papers failed with code" in lower:
+            code = "query_pipeline_failed"
+        elif stage_l == "ocr":
+            code = "ocr_pipeline_failed"
+        elif stage_l == "query":
+            code = "query_pipeline_failed"
+        return code, text
 
     def _row_item_key(self, row):
         return (
@@ -401,7 +489,16 @@ class DemoHandler(BaseHTTPRequestHandler):
     def _status_path(self, job_dir):
         return job_dir / "status.json"
 
-    def _write_status(self, job_dir, stage, done=None, total=None, message=None):
+    def _write_status(
+        self,
+        job_dir,
+        stage,
+        done=None,
+        total=None,
+        message=None,
+        error_code=None,
+        extra=None,
+    ):
         payload = {
             "stage": stage,
             "done": done,
@@ -409,6 +506,10 @@ class DemoHandler(BaseHTTPRequestHandler):
             "message": message,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        if error_code:
+            payload["error_code"] = error_code
+        if isinstance(extra, dict) and extra:
+            payload["extra"] = extra
         self._status_path(job_dir).write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -545,7 +646,8 @@ class DemoHandler(BaseHTTPRequestHandler):
         if not selected:
             raise ValueError("no matching items in items.jsonl")
 
-        api_key = self._resolve_api_key(payload)
+        api_key, api_key_source = self._resolve_api_key_with_source(payload)
+        print(f"[runtime] query api_key_source={api_key_source}")
         if not api_key:
             raise ValueError(
                 "missing API key (set PaperView API Key in Settings, then Save)"
@@ -631,6 +733,21 @@ class DemoHandler(BaseHTTPRequestHandler):
             self._write_status(job_dir, "query", done, total)
             time.sleep(1)
         if proc.returncode != 0:
+            probe = self._runtime_check(
+                {
+                    "api_key": api_key,
+                    "base_url": self._resolve_runtime_base_url(payload),
+                    "model": self._resolve_runtime_model(payload),
+                    "check_remote": True,
+                    "timeout_s": 8,
+                }
+            )
+            if isinstance(probe, dict) and not probe.get("ok"):
+                probe_code = str(probe.get("code") or "query_pipeline_failed").strip()
+                probe_error = str(probe.get("error") or "").strip()
+                if probe_error:
+                    raise RuntimeError(f"{probe_code}: {probe_error}")
+                raise RuntimeError(probe_code)
             raise RuntimeError(f"query_papers failed with code {proc.returncode}")
         done = 0
         total = len(selected)
@@ -702,6 +819,136 @@ class DemoHandler(BaseHTTPRequestHandler):
         html = view_path.read_text(encoding="utf-8")
         return self._send_html(200, html)
 
+    def _runtime_info(self, payload=None):
+        key, source = self._resolve_api_key_with_source(payload)
+        base_url = self._resolve_runtime_base_url(payload)
+        model = self._resolve_runtime_model(payload)
+        timeout_s = self._resolve_runtime_timeout_s(payload)
+        runtime = {
+            "api_key_source": source,
+            "env_visible": bool(
+                self._pick_non_empty_str(
+                    os.environ.get("SILICONFLOW_API_KEY"),
+                    os.environ.get("OPENAI_API_KEY"),
+                    default="",
+                )
+            ),
+            "llm_config_path": LLM_CONFIG_PATH or "",
+            "base_url": base_url,
+            "model": model,
+            "timeout_s": timeout_s,
+            "platform": sys.platform,
+            "profile": str(self._base_dir()),
+        }
+        return key, source, base_url, model, timeout_s, runtime
+
+    def _runtime_check(self, payload=None):
+        req = payload if isinstance(payload, dict) else {}
+        check_remote = bool(req.get("check_remote"))
+        api_key, source, base_url, model, timeout_s, runtime = self._runtime_info(req)
+
+        print(
+            f"[runtime] check_remote={check_remote} api_key_source={source} "
+            f"base_url={base_url} model={model} timeout_s={timeout_s}"
+        )
+
+        if not api_key:
+            return {
+                "ok": False,
+                "code": "api_key_missing",
+                "error": "missing API key (set PaperView API Key in Settings, then Save)",
+                "runtime": runtime,
+            }
+
+        if not check_remote:
+            return {"ok": True, "runtime": runtime}
+
+        url = f"{base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Return only: OK"}],
+            "temperature": 0.0,
+            "max_tokens": 4,
+        }
+
+        start = time.time()
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=timeout_s)
+            latency_ms = int((time.time() - start) * 1000)
+            status = int(resp.status_code)
+            if status in {401, 403}:
+                return {
+                    "ok": False,
+                    "code": "remote_api_auth",
+                    "status": status,
+                    "error": f"remote api auth failed (HTTP {status})",
+                    "runtime": runtime,
+                    "remote": {"reachable": False, "url": url, "latency_ms": latency_ms},
+                }
+            if status >= 400:
+                snippet = (resp.text or "").strip().replace("\n", " ")[:240]
+                return {
+                    "ok": False,
+                    "code": "remote_api_http_error",
+                    "status": status,
+                    "error": f"remote api returned HTTP {status}: {snippet}",
+                    "runtime": runtime,
+                    "remote": {"reachable": False, "url": url, "latency_ms": latency_ms},
+                }
+
+            data = {}
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            remote_model = data.get("model") if isinstance(data, dict) else None
+            return {
+                "ok": True,
+                "runtime": runtime,
+                "remote": {
+                    "reachable": True,
+                    "status": status,
+                    "latency_ms": latency_ms,
+                    "model": remote_model or model,
+                    "url": url,
+                },
+            }
+        except requests.exceptions.Timeout as e:
+            return {
+                "ok": False,
+                "code": "remote_api_timeout",
+                "error": str(e),
+                "runtime": runtime,
+                "remote": {"reachable": False, "url": url},
+            }
+        except requests.exceptions.ConnectionError as e:
+            return {
+                "ok": False,
+                "code": "remote_api_unreachable",
+                "error": str(e),
+                "runtime": runtime,
+                "remote": {"reachable": False, "url": url},
+            }
+        except requests.exceptions.RequestException as e:
+            status = None
+            if getattr(e, "response", None) is not None:
+                status = int(e.response.status_code)
+            code = "remote_api_http_error" if status else "remote_api_unreachable"
+            if status in {401, 403}:
+                code = "remote_api_auth"
+            return {
+                "ok": False,
+                "code": code,
+                "status": status,
+                "error": str(e),
+                "runtime": runtime,
+                "remote": {"reachable": False, "url": url},
+            }
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
@@ -764,7 +1011,15 @@ class DemoHandler(BaseHTTPRequestHandler):
                 try:
                     self._run_query_pipeline(payload, job_id)
                 except Exception as e:
-                    self._write_status(job_dir, "error", 0, len(item_keys) or 0, str(e))
+                    code, text = self._classify_exception(e, stage="query")
+                    self._write_status(
+                        job_dir,
+                        "error",
+                        0,
+                        len(item_keys) or 0,
+                        text,
+                        error_code=code,
+                    )
 
             threading.Thread(target=run_job, daemon=True).start()
             return self._send_json(200, {"result_url": result_url, "job_id": job_id})
@@ -782,10 +1037,31 @@ class DemoHandler(BaseHTTPRequestHandler):
                 try:
                     self._run_ocr_pipeline(payload, job_id)
                 except Exception as e:
-                    self._write_status(job_dir, "error", 0, len(item_keys) or 0, str(e))
+                    code, text = self._classify_exception(e, stage="ocr")
+                    self._write_status(
+                        job_dir,
+                        "error",
+                        0,
+                        len(item_keys) or 0,
+                        text,
+                        error_code=code,
+                    )
 
             threading.Thread(target=run_job, daemon=True).start()
             return self._send_json(200, {"job_id": job_id})
+        if path == "/runtime/check":
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            try:
+                return self._send_json(200, self._runtime_check(payload))
+            except Exception as e:
+                code, text = self._classify_exception(e, stage="runtime")
+                return self._send_json(
+                    500,
+                    {"ok": False, "code": code, "error": text},
+                )
         if path == "/ingest":
             try:
                 payload = json.loads(body.decode("utf-8") or "{}")

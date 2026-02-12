@@ -18,6 +18,7 @@ class _RuntimeResolver:
     _pick_non_empty_str = local_service.DemoHandler._pick_non_empty_str
     _load_runtime_config = local_service.DemoHandler._load_runtime_config
     _resolve_ocr_concurrency = local_service.DemoHandler._resolve_ocr_concurrency
+    _resolve_api_key_with_source = local_service.DemoHandler._resolve_api_key_with_source
     _resolve_api_key = local_service.DemoHandler._resolve_api_key
 
 
@@ -103,6 +104,14 @@ class RuntimeConfigResolutionTests(unittest.TestCase):
             "cfg-key",
         )
 
+        value, source = resolver._resolve_api_key_with_source({})
+        self.assertEqual(value, "cfg-key")
+        self.assertEqual(source, "prefs")
+
+        value, source = resolver._resolve_api_key_with_source({"api_key": "payload-key"})
+        self.assertEqual(value, "payload-key")
+        self.assertEqual(source, "request")
+
     def test_api_key_resolution_env_fallback(self):
         self._write_cfg({})
         resolver = _RuntimeResolver()
@@ -118,6 +127,10 @@ class RuntimeConfigResolutionTests(unittest.TestCase):
         os.environ["SILICONFLOW_API_KEY"] = ""
         os.environ["OPENAI_API_KEY"] = ""
         self.assertEqual(resolver._resolve_api_key({}), "")
+
+        value, source = resolver._resolve_api_key_with_source({})
+        self.assertEqual(value, "")
+        self.assertEqual(source, "none")
 
 if __name__ == "__main__":
     unittest.main()
