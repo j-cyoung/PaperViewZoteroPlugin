@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.32 - 2026-02-12
+
+**Changed**
+- Bumped version for auto-update testing.
+
 ## v0.5.31 - 2026-02-12
 
 **Changed**
