@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.2 - 2026-02-12
+
+**Changed**
+- Bumped version for testing Zotero auto-update.
+
 ## v0.5.1 - 2026-02-12
 
 **Added**

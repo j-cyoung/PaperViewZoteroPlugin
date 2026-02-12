@@ -3,9 +3,9 @@
     "paperview-query@local": {
       "updates": [
         {
-          "version": "0.5.1",
-          "update_link": "https://github.com/j-cyoung/PaperViewZoteroPlugin/releases/download/v0.5.1/paperview-query.xpi",
-          "update_hash": "sha256:7a5514377e348fa65cc109b37539076718382cab8dca791dae689520a448e981",
+          "version": "0.5.2",
+          "update_link": "https://github.com/j-cyoung/PaperViewZoteroPlugin/releases/download/v0.5.2/paperview-query.xpi",
+          "update_hash": "sha256:75200f86b2c25077539da1d202eeeb55dcbdeffa40010100d4b1368fbf6ad6c1",
           "applications": {
             "zotero": {
               "strict_min_version": "8.0",
