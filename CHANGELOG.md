@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.1 - 2026-02-12
+
+**Added**
+- Added a Zotero auto-update feed (`updates.json`) and wired `manifest.json#update_url` to enable automatic plugin updates.
+
 ## v0.5.0 - 2026-02-12
 
 **Added**
